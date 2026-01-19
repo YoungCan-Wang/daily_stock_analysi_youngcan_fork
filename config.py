@@ -179,7 +179,7 @@ class Config:
         serpapi_keys_str = os.getenv('SERPAPI_API_KEYS', '')
         serpapi_keys = [k.strip() for k in serpapi_keys_str.split(',') if k.strip()]
         
-        return cls(
+        instance = cls(
             stock_list=stock_list,
             feishu_app_id=os.getenv('FEISHU_APP_ID'),
             feishu_app_secret=os.getenv('FEISHU_APP_SECRET'),
@@ -223,6 +223,20 @@ class Config:
             webui_host=os.getenv('WEBUI_HOST', '127.0.0.1'),
             webui_port=int(os.getenv('WEBUI_PORT', '8000')),
         )
+        
+        # === 自动应用代理配置 ===
+        http_proxy = os.getenv('HTTP_PROXY')
+        https_proxy = os.getenv('HTTPS_PROXY')
+        
+        if http_proxy:
+            os.environ['http_proxy'] = http_proxy
+            os.environ['HTTP_PROXY'] = http_proxy
+            
+        if https_proxy:
+            os.environ['https_proxy'] = https_proxy
+            os.environ['HTTPS_PROXY'] = https_proxy
+            
+        return instance
     
     @classmethod
     def reset_instance(cls) -> None:
