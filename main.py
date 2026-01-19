@@ -900,8 +900,18 @@ def main() -> int:
     # 解析股票列表
     stock_codes = None
     if args.stocks:
+        # 1. 优先使用命令行参数 --stocks
         stock_codes = [code.strip() for code in args.stocks.split(',') if code.strip()]
         logger.info(f"使用命令行指定的股票列表: {stock_codes}")
+    else:
+        # 2. 如果没有命令行参数，检查 STOCK_LIST 环境变量
+        # 你的需求：如果 .env 里配置了 STOCK_LIST，也视为指定了列表
+        # Config 类已经读取了 .env 中的 STOCK_LIST，这里我们只是明确地把它作为"指定列表"传入
+        # 这样在 run_full_analysis 中就会优先使用这个列表，而不是再去 refresh_stock_list
+        env_stocks = config.stock_list
+        if env_stocks:
+            stock_codes = env_stocks
+            logger.info(f"使用 .env 配置的股票列表: {stock_codes}")
     
     # === 启动 WebUI (如果启用) ===
     # 优先级: 命令行参数 > 配置文件
