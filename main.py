@@ -45,6 +45,7 @@ from config import get_config, Config
 from storage import get_db, DatabaseManager
 from data_provider import DataFetcherManager
 from data_provider.akshare_fetcher import AkshareFetcher, RealtimeQuote, ChipDistribution
+from data_provider.efinance_fetcher import EfinanceFetcher
 from analyzer import GeminiAnalyzer, AnalysisResult, STOCK_NAME_MAP
 from notification import NotificationService, NotificationChannel, send_daily_report
 from search_service import SearchService, SearchResponse
@@ -150,9 +151,11 @@ class StockAnalysisPipeline:
         self.db = get_db()
         self.fetcher_manager = DataFetcherManager()
         self.akshare_fetcher = AkshareFetcher()  # 用于获取增强数据（量比、筹码等）
+        self.efinance_fetcher = EfinanceFetcher()  # 用于股票名称等基础信息兜底
         self.trend_analyzer = StockTrendAnalyzer()  # 趋势分析器
         self.analyzer = GeminiAnalyzer()
         self.notifier = NotificationService()
+        self.stock_name_cache: Dict[str, str] = {}
         
         # 初始化搜索服务
         self.search_service = SearchService(
@@ -202,6 +205,9 @@ class StockAnalysisPipeline:
             
             if df is None or df.empty:
                 return False, "获取数据为空"
+
+            # 缓存股票名称（若数据源提供）
+            self._update_stock_name_cache(code, df)
             
             # 保存到数据库
             saved_count = self.db.save_daily_data(df, code, source_name)
@@ -213,6 +219,48 @@ class StockAnalysisPipeline:
             error_msg = f"获取/保存数据失败: {str(e)}"
             logger.error(f"[{code}] {error_msg}")
             return False, error_msg
+
+    def _update_stock_name_cache(self, code: str, df: Any) -> None:
+        """
+        从行情数据中缓存股票名称（如果存在）
+        """
+        try:
+            if df is None or df.empty or 'name' not in df.columns:
+                return
+            name_series = df['name'].dropna()
+            if name_series.empty:
+                return
+            name = str(name_series.iloc[-1]).strip()
+            if name and not name.startswith('股票'):
+                self.stock_name_cache[code] = name
+        except Exception as e:
+            logger.debug(f"[{code}] 缓存股票名称失败: {e}")
+
+    def _fetch_stock_name_from_efinance(self, code: str) -> str:
+        """
+        从 efinance 获取股票名称（实时行情优先，基础信息兜底）
+        """
+        try:
+            quote = self.efinance_fetcher.get_realtime_quote(code)
+            if quote and quote.name:
+                return str(quote.name).strip()
+        except Exception as e:
+            logger.debug(f"[{code}] efinance 实时行情获取名称失败: {e}")
+
+        try:
+            info = self.efinance_fetcher.get_base_info(code)
+            if info:
+                for key in (
+                    '股票名称', '股票简称', '证券名称', '证券简称',
+                    '名称', 'name', '简称'
+                ):
+                    val = info.get(key)
+                    if val:
+                        return str(val).strip()
+        except Exception as e:
+            logger.debug(f"[{code}] efinance 基础信息获取名称失败: {e}")
+
+        return ""
     
     def analyze_stock(self, code: str) -> Optional[AnalysisResult]:
         """
@@ -233,8 +281,8 @@ class StockAnalysisPipeline:
             AnalysisResult 或 None（如果分析失败）
         """
         try:
-            # 获取股票名称（优先从实时行情获取真实名称）
-            stock_name = STOCK_NAME_MAP.get(code, '')
+            # 获取股票名称（优先使用缓存/映射，再尝试实时行情兜底）
+            stock_name = self.stock_name_cache.get(code, '') or STOCK_NAME_MAP.get(code, '')
             
             # Step 1: 获取实时行情（量比、换手率等）
             realtime_quote: Optional[RealtimeQuote] = None
@@ -244,10 +292,18 @@ class StockAnalysisPipeline:
                     # 使用实时行情返回的真实股票名称
                     if realtime_quote.name:
                         stock_name = realtime_quote.name
+                        self.stock_name_cache[code] = stock_name
                     logger.info(f"[{code}] {stock_name} 实时行情: 价格={realtime_quote.price}, "
                               f"量比={realtime_quote.volume_ratio}, 换手率={realtime_quote.turnover_rate}%")
             except Exception as e:
                 logger.warning(f"[{code}] 获取实时行情失败: {e}")
+
+            # 如果名称仍为空，尝试从 efinance 获取
+            if not stock_name or stock_name.startswith('股票'):
+                fallback_name = self._fetch_stock_name_from_efinance(code)
+                if fallback_name:
+                    stock_name = fallback_name
+                    self.stock_name_cache[code] = stock_name
             
             # 如果还是没有名称，使用代码作为名称
             if not stock_name:

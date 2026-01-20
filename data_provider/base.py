@@ -35,7 +35,8 @@ logger = logging.getLogger(__name__)
 
 
 # === 标准化列名定义 ===
-STANDARD_COLUMNS = ['date', 'open', 'high', 'low', 'close', 'volume', 'amount', 'pct_chg']
+# name 为可选字段（部分数据源提供股票名称）
+STANDARD_COLUMNS = ['name', 'date', 'open', 'high', 'low', 'close', 'volume', 'amount', 'pct_chg']
 
 
 class DataFetchError(Exception):

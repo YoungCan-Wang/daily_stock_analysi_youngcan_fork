@@ -435,6 +435,21 @@ class NotificationService:
             return ('卖出', '🔴', '卖出')
         else:
             return ('观望', '⚪', '观望')
+
+    def _count_signal_summary(self, results: List[AnalysisResult]) -> Dict[str, int]:
+        """
+        按信号等级统计买入/持有/卖出数量（与仪表盘展示一致）
+        """
+        counts = {'buy': 0, 'hold': 0, 'sell': 0}
+        for result in results:
+            signal_text, _, _ = self._get_signal_level(result)
+            if signal_text in ['强烈买入', '买入']:
+                counts['buy'] += 1
+            elif signal_text in ['持有', '观望']:
+                counts['hold'] += 1
+            else:
+                counts['sell'] += 1
+        return counts
     
     def generate_dashboard_report(
         self, 
@@ -459,15 +474,16 @@ class NotificationService:
         # 按评分排序（高分在前）
         sorted_results = sorted(results, key=lambda x: x.sentiment_score, reverse=True)
         
-        # 统计信息
-        buy_count = sum(1 for r in results if r.operation_advice in ['买入', '加仓', '强烈买入'])
-        sell_count = sum(1 for r in results if r.operation_advice in ['卖出', '减仓', '强烈卖出'])
-        hold_count = sum(1 for r in results if r.operation_advice in ['持有', '观望'])
+        # 统计信息（与仪表盘信号保持一致）
+        counts = self._count_signal_summary(results)
+        buy_count = counts['buy']
+        hold_count = counts['hold']
+        sell_count = counts['sell']
         
         report_lines = [
             f"# 🎯 {report_date} 决策仪表盘",
             "",
-            f"> 共分析 **{len(results)}** 只股票 | 🟢买入:{buy_count} 🟡观望:{hold_count} 🔴卖出:{sell_count}",
+            f"> 共分析 **{len(results)}** 只股票 | 🟢买入:{buy_count} 🟡持有/观望:{hold_count} 🔴卖出:{sell_count}",
             "",
             "---",
             "",
@@ -719,15 +735,16 @@ class NotificationService:
         # 按评分排序
         sorted_results = sorted(results, key=lambda x: x.sentiment_score, reverse=True)
         
-        # 统计
-        buy_count = sum(1 for r in results if r.operation_advice in ['买入', '加仓', '强烈买入'])
-        sell_count = sum(1 for r in results if r.operation_advice in ['卖出', '减仓', '强烈卖出'])
-        hold_count = sum(1 for r in results if r.operation_advice in ['持有', '观望'])
+        # 统计（与仪表盘信号保持一致）
+        counts = self._count_signal_summary(results)
+        buy_count = counts['buy']
+        hold_count = counts['hold']
+        sell_count = counts['sell']
         
         lines = [
             f"## 🎯 {report_date} 决策仪表盘",
             "",
-            f"> {len(results)}只股票 | 🟢买入:{buy_count} 🟡观望:{hold_count} 🔴卖出:{sell_count}",
+            f"> {len(results)}只股票 | 🟢买入:{buy_count} 🟡持有/观望:{hold_count} 🔴卖出:{sell_count}",
             "",
         ]
         
