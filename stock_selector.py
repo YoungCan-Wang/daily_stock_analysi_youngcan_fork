@@ -48,8 +48,10 @@ class ConceptBoardSelector:
         selected_set = set()
         board_summary: Dict[str, List[str]] = {}
 
-        for board_name in boards:
-            codes = self._select_board_stocks(board_name, selected_set)
+        for board in boards:
+            board_name = board["name"]
+            board_code = board.get("code")
+            codes = self._select_board_stocks(board_name, selected_set, board_code)
             board_summary[board_name] = codes
 
             selected_codes.extend(codes)
@@ -65,15 +67,19 @@ class ConceptBoardSelector:
         )
         return selected_codes
 
-    def _get_top_concept_boards(self, top_n: int) -> List[str]:
+    def _get_top_concept_boards(self, top_n: int) -> List[Dict[str, Optional[str]]]:
         df = self.fetcher.get_concept_board_rankings()
         if df is None or df.empty:
             return []
 
-        name_col = self._pick_column(df, ["板块名称", "概念名称", "名称", "板块"])
+        name_col = self._pick_column(
+            df, ["板块名称", "概念名称", "概念", "名称", "板块", "name"]
+        )
         if not name_col:
             logger.warning("[板块选股] 未找到概念板块名称列")
             return []
+
+        code_col = self._pick_column(df, ["板块代码", "概念代码", "代码", "code"])
 
         change_col = self._pick_column(
             df, ["涨跌幅", "涨跌幅(%)", "涨跌幅%", "涨跌幅(%)"]
@@ -85,14 +91,27 @@ class ConceptBoardSelector:
             df = df.sort_values(by=change_col, ascending=False)
 
         top_df = df.head(max(top_n, 0))
-        boards = [
-            str(val).strip() for val in top_df[name_col].tolist() if str(val).strip()
-        ]
-        logger.info(f"[板块选股] 概念板块 Top{len(boards)}: {boards}")
+        boards = []
+        for _, row in top_df.iterrows():
+            name = str(row[name_col]).strip()
+            if not name:
+                continue
+            code = None
+            if code_col:
+                code_val = str(row.get(code_col, "")).strip()
+                if code_val:
+                    code = code_val
+            boards.append({"name": name, "code": code})
+
+        logger.info(
+            f"[板块选股] 概念板块 Top{len(boards)}: {[b['name'] for b in boards]}"
+        )
         return boards
 
-    def _select_board_stocks(self, board_name: str, selected_set: set) -> List[str]:
-        df = self.fetcher.get_concept_board_components(board_name)
+    def _select_board_stocks(
+        self, board_name: str, selected_set: set, board_code: Optional[str]
+    ) -> List[str]:
+        df = self.fetcher.get_concept_board_components(board_name, board_code)
         if df is None or df.empty:
             logger.warning(f"[板块选股] {board_name} 成分股为空")
             return []

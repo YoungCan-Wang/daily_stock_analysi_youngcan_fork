@@ -19,8 +19,10 @@ AkshareFetcher - 主数据源 (Priority 1)
 """
 
 import logging
+import os
 import random
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional, Dict, Any
@@ -35,6 +37,7 @@ from tenacity import (
 )
 
 from .base import BaseFetcher, DataFetchError, RateLimitError, STANDARD_COLUMNS
+from proxy_utils import no_proxy
 
 
 @dataclass
@@ -257,7 +260,12 @@ class AkshareFetcher(BaseFetcher):
     name = "AkshareFetcher"
     priority = 1
 
-    def __init__(self, sleep_min: float = 2.0, sleep_max: float = 5.0):
+    def __init__(
+        self,
+        sleep_min: float = 2.0,
+        sleep_max: float = 5.0,
+        no_proxy: Optional[bool] = None,
+    ):
         """
         初始化 AkshareFetcher
 
@@ -267,7 +275,24 @@ class AkshareFetcher(BaseFetcher):
         """
         self.sleep_min = sleep_min
         self.sleep_max = sleep_max
+        if no_proxy is None:
+            no_proxy = os.getenv("AKSHARE_NO_PROXY", "").strip().lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            )
+        self.no_proxy = no_proxy
         self._last_request_time: Optional[float] = None
+
+    @contextmanager
+    def _proxy_disabled(self):
+        if not self.no_proxy:
+            yield
+            return
+
+        with no_proxy():
+            yield
 
     def _set_random_user_agent(self) -> None:
         """
@@ -369,13 +394,14 @@ class AkshareFetcher(BaseFetcher):
 
             api_start = _time.time()
 
-            df = ak.stock_zh_a_hist(
-                symbol=stock_code,
-                period="daily",
-                start_date=start_date.replace("-", ""),
-                end_date=end_date.replace("-", ""),
-                adjust="qfq",  # 前复权
-            )
+            with self._proxy_disabled():
+                df = ak.stock_zh_a_hist(
+                    symbol=stock_code,
+                    period="daily",
+                    start_date=start_date.replace("-", ""),
+                    end_date=end_date.replace("-", ""),
+                    adjust="qfq",  # 前复权
+                )
 
             api_elapsed = _time.time() - api_start
 
@@ -655,7 +681,8 @@ class AkshareFetcher(BaseFetcher):
 
                         api_start = _time.time()
 
-                        df = ak.stock_zh_a_spot_em()
+                        with self._proxy_disabled():
+                            df = ak.stock_zh_a_spot_em()
 
                         api_elapsed = _time.time() - api_start
                         logger.info(
@@ -956,7 +983,8 @@ class AkshareFetcher(BaseFetcher):
 
             api_start = _time.time()
 
-            df = ak.stock_cyq_em(symbol=stock_code)
+            with self._proxy_disabled():
+                df = ak.stock_cyq_em(symbol=stock_code)
 
             api_elapsed = _time.time() - api_start
 
@@ -1047,26 +1075,177 @@ class AkshareFetcher(BaseFetcher):
         """
         import akshare as ak
 
+        source = os.getenv("CONCEPT_BOARD_SOURCE", "auto").strip().lower()
+        if source == "ths":
+            logger.info("[API调用] 使用同花顺概念板块排行 (CONCEPT_BOARD_SOURCE=ths)")
+            try:
+                self._set_random_user_agent()
+                self._enforce_rate_limit()
+                with self._proxy_disabled():
+                    df = ak.stock_board_concept_name_ths()
+                if df is None or df.empty:
+                    logger.warning(
+                        "[API返回] ak.stock_board_concept_name_ths 返回空数据"
+                    )
+                else:
+                    logger.info(
+                        f"[API返回] ak.stock_board_concept_name_ths 成功: 返回 {len(df)} 个板块"
+                    )
+                return df
+            except Exception as e:
+                logger.error(f"[API错误] 获取概念板块排行(THS)失败: {e}")
+                return None
+
+        last_error: Optional[Exception] = None
+        for attempt in range(1, 4):
+            try:
+                self._set_random_user_agent()
+                self._enforce_rate_limit()
+
+                logger.info(
+                    "[API调用] ak.stock_board_concept_name_em() 获取概念板块排行..."
+                    f" (attempt {attempt}/3)"
+                )
+                with self._proxy_disabled():
+                    df = ak.stock_board_concept_name_em()
+                if df is None or df.empty:
+                    logger.warning(
+                        "[API返回] ak.stock_board_concept_name_em 返回空数据"
+                    )
+                else:
+                    logger.info(
+                        f"[API返回] ak.stock_board_concept_name_em 成功: 返回 {len(df)} 个板块"
+                    )
+                return df
+            except Exception as e:
+                last_error = e
+                logger.warning(
+                    f"[API错误] 获取概念板块排行失败 (attempt {attempt}/3): {e}"
+                )
+                time.sleep(min(2**attempt, 6))
+
+        logger.error(f"[API错误] 获取概念板块排行最终失败: {last_error}")
+        logger.warning("[API回退] 尝试 Eastmoney 备用节点获取概念板块排行")
+        df = self._get_concept_rankings_em_fallback()
+        if df is not None and not df.empty:
+            return df
+
+        logger.warning(
+            "[API回退] 尝试 ak.stock_board_concept_name_ths() 获取概念板块排行"
+        )
         try:
             self._set_random_user_agent()
             self._enforce_rate_limit()
 
-            logger.info(
-                "[API调用] ak.stock_board_concept_name_em() 获取概念板块排行..."
-            )
-            df = ak.stock_board_concept_name_em()
+            with self._proxy_disabled():
+                df = ak.stock_board_concept_name_ths()
             if df is None or df.empty:
-                logger.warning("[API返回] ak.stock_board_concept_name_em 返回空数据")
+                logger.warning("[API返回] ak.stock_board_concept_name_ths 返回空数据")
             else:
                 logger.info(
-                    f"[API返回] ak.stock_board_concept_name_em 成功: 返回 {len(df)} 个板块"
+                    f"[API返回] ak.stock_board_concept_name_ths 成功: 返回 {len(df)} 个板块"
                 )
             return df
         except Exception as e:
-            logger.error(f"[API错误] 获取概念板块排行失败: {e}")
+            logger.error(f"[API错误] 获取概念板块排行(THS)失败: {e}")
             return None
 
-    def get_concept_board_components(self, board_name: str) -> Optional[pd.DataFrame]:
+    def _get_concept_rankings_em_fallback(self) -> Optional[pd.DataFrame]:
+        from akshare.utils.func import fetch_paginated_data
+
+        hosts = ["79", "82", "17", "18", "29"]
+        params = {
+            "pn": "1",
+            "pz": "100",
+            "po": "1",
+            "np": "1",
+            "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+            "fltt": "2",
+            "invt": "2",
+            "fid": "f12",
+            "fs": "m:90 t:3 f:!50",
+            "fields": "f2,f3,f4,f8,f12,f14,f15,f16,f17,f18,f20,f21,f24,f25,f22,f33,f11,f62,f128,f124,f107,f104,f105,f136",
+        }
+
+        for host in hosts:
+            try:
+                url = f"https://{host}.push2.eastmoney.com/api/qt/clist/get"
+                with self._proxy_disabled():
+                    temp_df = fetch_paginated_data(url, params)
+                if temp_df is None or temp_df.empty:
+                    continue
+
+                temp_df.columns = [
+                    "排名",
+                    "最新价",
+                    "涨跌幅",
+                    "涨跌额",
+                    "换手率",
+                    "_",
+                    "板块代码",
+                    "板块名称",
+                    "_",
+                    "_",
+                    "_",
+                    "_",
+                    "总市值",
+                    "_",
+                    "_",
+                    "_",
+                    "_",
+                    "_",
+                    "_",
+                    "上涨家数",
+                    "下跌家数",
+                    "_",
+                    "_",
+                    "领涨股票",
+                    "_",
+                    "_",
+                    "领涨股票-涨跌幅",
+                ]
+                temp_df = temp_df[
+                    [
+                        "排名",
+                        "板块名称",
+                        "板块代码",
+                        "最新价",
+                        "涨跌额",
+                        "涨跌幅",
+                        "总市值",
+                        "换手率",
+                        "上涨家数",
+                        "下跌家数",
+                        "领涨股票",
+                        "领涨股票-涨跌幅",
+                    ]
+                ]
+                numeric_cols = [
+                    "最新价",
+                    "涨跌额",
+                    "涨跌幅",
+                    "总市值",
+                    "换手率",
+                    "上涨家数",
+                    "下跌家数",
+                    "领涨股票-涨跌幅",
+                ]
+                for col in numeric_cols:
+                    temp_df[col] = pd.to_numeric(temp_df[col], errors="coerce")
+
+                logger.info(
+                    f"[API返回] Eastmoney 备用节点成功: {host} 返回 {len(temp_df)} 个板块"
+                )
+                return temp_df
+            except Exception as e:
+                logger.warning(f"[API错误] Eastmoney 备用节点失败: {host} {e}")
+                continue
+
+        return None
+
+    def get_concept_board_components(
+        self, board_name: str, board_code: Optional[str] = None
+    ) -> Optional[pd.DataFrame]:
         """
         获取概念板块成分股
 
@@ -1074,25 +1253,214 @@ class AkshareFetcher(BaseFetcher):
         """
         import akshare as ak
 
+        if board_code and not str(board_code).startswith("BK"):
+            logger.info(f"[API调用] 同花顺概念板块成分股: {board_name}")
+            df = self._get_concept_components_ths(board_code)
+            if df is not None and not df.empty:
+                return df
+
+        last_error: Optional[Exception] = None
+        for attempt in range(1, 4):
+            try:
+                self._set_random_user_agent()
+                self._enforce_rate_limit()
+
+                logger.info(
+                    f"[API调用] ak.stock_board_concept_cons_em(symbol={board_name}) 获取概念板块成分股... (attempt {attempt}/3)"
+                )
+                with self._proxy_disabled():
+                    df = ak.stock_board_concept_cons_em(symbol=board_name)
+                if df is None or df.empty:
+                    logger.warning(
+                        f"[API返回] ak.stock_board_concept_cons_em 返回空数据: {board_name}"
+                    )
+                else:
+                    logger.info(
+                        f"[API返回] ak.stock_board_concept_cons_em 成功: {board_name} 返回 {len(df)} 只股票"
+                    )
+                return df
+            except Exception as e:
+                last_error = e
+                logger.warning(
+                    f"[API错误] 获取概念板块成分股失败 (attempt {attempt}/3): {board_name}, {e}"
+                )
+                time.sleep(min(2**attempt, 6))
+
+        logger.error(
+            f"[API错误] 获取概念板块成分股最终失败: {board_name}, {last_error}"
+        )
+        if board_code:
+            if str(board_code).startswith("BK"):
+                logger.warning(
+                    f"[API回退] 尝试 Eastmoney 备用节点获取概念板块成分股: {board_name}"
+                )
+                df = self._get_concept_components_em_fallback(board_code)
+                if df is not None and not df.empty:
+                    return df
+
+                ths_code = self._get_concept_code_ths(board_name)
+                if ths_code:
+                    logger.warning(f"[API回退] 尝试同花顺概念板块成分股: {board_name}")
+                    df = self._get_concept_components_ths(ths_code)
+                    if df is not None and not df.empty:
+                        return df
+            else:
+                logger.warning(f"[API回退] 尝试同花顺概念板块成分股: {board_name}")
+                df = self._get_concept_components_ths(board_code)
+                if df is not None and not df.empty:
+                    return df
+
+        return None
+
+    def _get_concept_components_em_fallback(
+        self, board_code: str
+    ) -> Optional[pd.DataFrame]:
+        from akshare.utils.func import fetch_paginated_data
+
+        hosts = ["29", "79", "82", "17", "18"]
+        params = {
+            "pn": "1",
+            "pz": "100",
+            "po": "1",
+            "np": "1",
+            "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+            "fltt": "2",
+            "invt": "2",
+            "fid": "f12",
+            "fs": f"b:{board_code} f:!50",
+            "fields": "f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f12,f13,f14,f15,f16,f17,f18,f20,f21,f23,"
+            "f24,f25,f22,f11,f62,f128,f136,f115,f152,f45",
+        }
+
+        for host in hosts:
+            try:
+                url = f"https://{host}.push2.eastmoney.com/api/qt/clist/get"
+                with self._proxy_disabled():
+                    temp_df = fetch_paginated_data(url, params)
+                if temp_df is None or temp_df.empty:
+                    continue
+
+                temp_df.columns = [
+                    "序号",
+                    "_",
+                    "最新价",
+                    "涨跌幅",
+                    "涨跌额",
+                    "成交量",
+                    "成交额",
+                    "振幅",
+                    "换手率",
+                    "市盈率-动态",
+                    "_",
+                    "_",
+                    "代码",
+                    "_",
+                    "名称",
+                    "最高",
+                    "最低",
+                    "今开",
+                    "昨收",
+                    "_",
+                    "_",
+                    "_",
+                    "市净率",
+                    "_",
+                    "_",
+                    "_",
+                    "_",
+                    "_",
+                    "_",
+                    "_",
+                    "_",
+                    "_",
+                    "_",
+                ]
+                temp_df = temp_df[
+                    [
+                        "序号",
+                        "代码",
+                        "名称",
+                        "最新价",
+                        "涨跌幅",
+                        "涨跌额",
+                        "成交量",
+                        "成交额",
+                        "振幅",
+                        "最高",
+                        "最低",
+                        "今开",
+                        "昨收",
+                        "换手率",
+                        "市盈率-动态",
+                        "市净率",
+                    ]
+                ]
+                numeric_cols = [
+                    "最新价",
+                    "涨跌幅",
+                    "涨跌额",
+                    "成交量",
+                    "成交额",
+                    "振幅",
+                    "最高",
+                    "最低",
+                    "今开",
+                    "昨收",
+                    "换手率",
+                    "市盈率-动态",
+                    "市净率",
+                ]
+                for col in numeric_cols:
+                    temp_df[col] = pd.to_numeric(temp_df[col], errors="coerce")
+
+                logger.info(
+                    f"[API返回] Eastmoney 备用节点成功: {host} 返回 {len(temp_df)} 只股票"
+                )
+                return temp_df
+            except Exception as e:
+                logger.warning(f"[API错误] Eastmoney 备用节点失败: {host} {e}")
+                continue
+
+        return None
+
+    def _get_concept_components_ths(self, board_code: str) -> Optional[pd.DataFrame]:
+        import requests
+        from io import StringIO
+
+        url = f"http://q.10jqka.com.cn/gn/detail/code/{board_code}/"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0 Safari/537.36",
+        }
+
+        try:
+            with self._proxy_disabled():
+                response = requests.get(url, headers=headers, timeout=15)
+            response.raise_for_status()
+            tables = pd.read_html(StringIO(response.text))
+            if not tables:
+                return None
+            return tables[0]
+        except Exception as e:
+            logger.warning(f"[API错误] 同花顺概念板块成分股失败: {board_code}, {e}")
+            return None
+
+    def _get_concept_code_ths(self, board_name: str) -> Optional[str]:
+        import akshare as ak
+
         try:
             self._set_random_user_agent()
             self._enforce_rate_limit()
-
-            logger.info(
-                f"[API调用] ak.stock_board_concept_cons_em(symbol={board_name}) 获取概念板块成分股..."
-            )
-            df = ak.stock_board_concept_cons_em(symbol=board_name)
+            with self._proxy_disabled():
+                df = ak.stock_board_concept_name_ths()
             if df is None or df.empty:
-                logger.warning(
-                    f"[API返回] ak.stock_board_concept_cons_em 返回空数据: {board_name}"
-                )
-            else:
-                logger.info(
-                    f"[API返回] ak.stock_board_concept_cons_em 成功: {board_name} 返回 {len(df)} 只股票"
-                )
-            return df
+                return None
+            match = df[df["name"] == board_name]
+            if match.empty:
+                return None
+            value = str(match.iloc[0]["code"]).strip()
+            return value or None
         except Exception as e:
-            logger.error(f"[API错误] 获取概念板块成分股失败: {board_name}, {e}")
+            logger.warning(f"[API错误] 获取同花顺概念板块代码失败: {board_name}, {e}")
             return None
 
 

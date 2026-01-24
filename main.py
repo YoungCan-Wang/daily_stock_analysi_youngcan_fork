@@ -856,11 +856,16 @@ def resolve_stock_codes(
 ) -> List[str]:
     """解析最终股票列表"""
     if stock_codes:
+        logger.info(f"[选股] 使用传入股票列表，共 {len(stock_codes)} 只")
         return stock_codes
 
     mode = (config.stock_list_mode or "manual").strip().lower()
+    logger.info(f"[选股] 模式: {mode}")
 
     if mode == "concept":
+        logger.info(
+            f"[选股] 概念板块 Top{config.concept_board_top_n}，每板块 {config.concept_stocks_per_board} 只"
+        )
         selector = ConceptBoardSelector(
             top_boards=config.concept_board_top_n,
             stocks_per_board=config.concept_stocks_per_board,
@@ -869,11 +874,13 @@ def resolve_stock_codes(
         )
         concept_codes = selector.select()
         if concept_codes:
+            logger.info(f"[选股] 概念板块选出 {len(concept_codes)} 只股票")
             return concept_codes
 
         logger.warning("概念板块选股为空，回退到 STOCK_LIST")
 
     config.refresh_stock_list()
+    logger.info(f"[选股] STOCK_LIST 共 {len(config.stock_list)} 只")
     return config.stock_list
 
 
