@@ -4,7 +4,7 @@ on:
   # 定时触发 - 每天北京时间 18:00 (UTC 10:00)
   schedule:
     - cron: '0 10 * * 1-5'  # 周一到周五，UTC 10:00 = 北京时间 18:00
-  
+
   # 手动触发
   workflow_dispatch:
     inputs:
@@ -14,118 +14,233 @@ on:
         default: 'full'
         type: choice
         options:
-          - full          # 完整分析（股票+大盘）
+          - full          # 完整分析（先板块→无股票则沙里淘金→个股+大盘）
           - market-only   # 仅大盘复盘
           - stocks-only   # 仅股票分析
+          - wyckoff       # 仅沙里淘金
 
 jobs:
   analyze:
     runs-on: ubuntu-latest
-    
+
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
-      
+
       - name: 设置 Python 环境
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
-      
+
       - name: 安装依赖
         run: |
           pip install --upgrade pip
           pip install -r requirements.txt
-      
+
       - name: 创建必要目录
         run: |
           mkdir -p data logs reports
-      
-      - name: 执行股票分析
+
+      - name: 设置运行模式
+        id: set_mode
+        run: |
+          MODE="${{ github.event.inputs.mode || 'full' }}"
+          echo "MODE=$MODE" >> $GITHUB_ENV
+          echo "运行模式: $MODE"
+
+      # ========== full 模式 1：先尝试板块选股（GitHub 用 secrets，本地用 .env）==========
+      - name: 尝试板块选股
+        id: concept
+        if: env.MODE == 'full'
         env:
-          # Gemini AI
+          FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
+          CONCEPT_BOARD_TOP_N: ${{ secrets.CONCEPT_BOARD_TOP_N || '3' }}
+          CONCEPT_STOCKS_PER_BOARD: ${{ secrets.CONCEPT_STOCKS_PER_BOARD || '2' }}
+        run: |
+          python main.py --concept-only
+          CONCEPT_EXIT=$?
+          echo "CONCEPT_EXIT=$CONCEPT_EXIT" >> $GITHUB_ENV
+          echo "板块选股退出码: $CONCEPT_EXIT (0=有股票 1=有板块无股票 2=失败)"
+          exit 0
+
+      # ========== full 模式 2：板块无股票或失败时，执行沙里淘金（分批，超时 2h）==========
+      - name: 执行沙里淘金（分批获取股票列表）
+        if: env.MODE == 'full' && env.CONCEPT_EXIT != '0'
+        timeout-minutes: 120
+        continue-on-error: true
+        env:
+          LOG_LEVEL: INFO
+          WYCKOFF_ENABLED: 'true'
+          WYCKOFF_TACTIC: 'all'
+          WYCKOFF_TRADING_DAYS: '30'
+          WYCKOFF_POOL_MODE: 'board'
+          WYCKOFF_BOARD: 'main,chinext'
+          WYCKOFF_GROUP_POWER: ${{ secrets.WYCKOFF_GROUP_POWER || 'true' }}
+          WYCKOFF_USE_CACHE: ${{ secrets.WYCKOFF_USE_CACHE || 'true' }}
+          WYCKOFF_RESULT_LIMIT: ${{ secrets.WYCKOFF_RESULT_LIMIT || '80' }}
+          FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
+        run: |
+          BATCH_SIZE=250
+          NUM_BATCHES=18
+          BATCH_SLEEP=30
+          for i in $(seq 0 $((NUM_BATCHES - 1))); do
+            echo "========== 沙里淘金 第 $((i+1))/$NUM_BATCHES 批 (offset=$((i*BATCH_SIZE)), limit=$BATCH_SIZE) =========="
+            export WYCKOFF_OFFSET=$((i * BATCH_SIZE))
+            export WYCKOFF_LIMIT_COUNT=$BATCH_SIZE
+            export WYCKOFF_OUTPUT_LIST="wyckoff_batch_${i}.txt"
+            python wyckoff_panning.py --no-notify || true
+            if [ $i -lt $((NUM_BATCHES - 1)) ]; then
+              echo "等待 ${BATCH_SLEEP}s 后执行下一批，降低限流风险..."
+              sleep $BATCH_SLEEP
+            fi
+          done
+
+      # ========== full 模式：合并沙里淘金结果（去重）==========
+      - name: 合并沙里淘金结果
+        if: env.MODE == 'full' && env.CONCEPT_EXIT != '0'
+        run: |
+          cat wyckoff_batch_*.txt 2>/dev/null | sort -u > wyckoff_stock_list.txt || true
+          if [ -s wyckoff_stock_list.txt ]; then
+            echo "合并完成，共 $(wc -l < wyckoff_stock_list.txt) 只股票（去重后）"
+          else
+            echo "无有效批次结果"
+          fi
+
+      # ========== full 模式：确定 STOCK_LIST（板块成功用板块列表，否则用沙里淘金或回退），成功/失败都发飞书 ==========
+      - name: 确定股票列表（full 模式）
+        if: env.MODE == 'full'
+        env:
+          FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
+          STOCK_LIST_FALLBACK: ${{ secrets.STOCK_LIST || '600519' }}
+        run: |
+          if [ -f concept_stock_list.txt ] && [ -s concept_stock_list.txt ]; then
+            echo "使用板块选股结果"
+            STOCK_LIST=$(paste -sd, concept_stock_list.txt)
+            echo "STOCK_LIST=$STOCK_LIST" >> $GITHUB_ENV
+            COUNT=$(wc -l < concept_stock_list.txt)
+            if [ -n "$FEISHU_WEBHOOK_URL" ]; then
+              curl -sS -X POST "$FEISHU_WEBHOOK_URL" \
+                -H "Content-Type: application/json" \
+                -d "{\"msg_type\":\"text\",\"content\":{\"text\":\"【每日股票分析】板块选股：成功，共 ${COUNT} 只股票，将直接执行个股分析。\"}}" || true
+            fi
+          elif [ -f wyckoff_stock_list.txt ] && [ -s wyckoff_stock_list.txt ]; then
+            echo "使用沙里淘金结果"
+            STOCK_LIST=$(paste -sd, wyckoff_stock_list.txt)
+            echo "STOCK_LIST=$STOCK_LIST" >> $GITHUB_ENV
+            TOTAL=$(wc -l < wyckoff_stock_list.txt)
+            BATCH_OK=0
+            for f in wyckoff_batch_*.txt; do [ -f "$f" ] && [ -s "$f" ] && BATCH_OK=$((BATCH_OK+1)); done
+            if [ -n "$FEISHU_WEBHOOK_URL" ]; then
+              curl -sS -X POST "$FEISHU_WEBHOOK_URL" \
+                -H "Content-Type: application/json" \
+                -d "{\"msg_type\":\"text\",\"content\":{\"text\":\"【每日股票分析】沙里淘金：完成，共 ${BATCH_OK} 批，合计 ${TOTAL} 只股票（去重），将执行后续个股分析。\"}}" || true
+            fi
+          else
+            echo "板块与沙里淘金均无结果，使用配置的 STOCK_LIST"
+            echo "STOCK_LIST=$STOCK_LIST_FALLBACK" >> $GITHUB_ENV
+            if [ -n "$FEISHU_WEBHOOK_URL" ]; then
+              curl -sS -X POST "$FEISHU_WEBHOOK_URL" \
+                -H "Content-Type: application/json" \
+                -d '{"msg_type":"text","content":{"text":"【每日股票分析】板块选股与沙里淘金均未产出股票列表，将使用仓库配置的 STOCK_LIST 执行后续分析。"}}' || true
+            fi
+          fi
+
+      # ========== market-only / stocks-only：使用仓库配置的 STOCK_LIST ==========
+      - name: 设置股票列表（非 full 模式）
+        if: env.MODE == 'market-only' || env.MODE == 'stocks-only'
+        run: |
+          echo "STOCK_LIST=${{ secrets.STOCK_LIST || '600519' }}" >> $GITHUB_ENV
+
+      # ========== 执行股票分析（full / market-only / stocks-only）==========
+      - name: 执行股票分析
+        if: env.MODE != 'wyckoff'
+        env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GEMINI_MODEL: ${{ secrets.GEMINI_MODEL || 'gemini-3-pro-preview' }}
           GEMINI_MODEL_FALLBACK: ${{ secrets.GEMINI_MODEL_FALLBACK || 'gemini-2.5-flash' }}
-          GEMINI_REQUEST_DELAY: '3.0'  # GitHub Actions 建议增加延时
-          
-          # 数据源 (可选)
+          GEMINI_REQUEST_DELAY: '3.0'
           TUSHARE_TOKEN: ${{ secrets.TUSHARE_TOKEN }}
-          
-          # 搜索服务
           BOCHA_API_KEYS: ${{ secrets.BOCHA_API_KEYS }}
           TAVILY_API_KEYS: ${{ secrets.TAVILY_API_KEYS }}
           SERPAPI_API_KEYS: ${{ secrets.SERPAPI_API_KEYS }}
-          
-          # OpenAI 兼容 API（备选）
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
           OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
-          
-          # 通知渠道（可同时配置多个，全部推送）
-          # 方式一：企业微信
           WECHAT_WEBHOOK_URL: ${{ secrets.WECHAT_WEBHOOK_URL }}
-          # 方式二：飞书
           FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
-          # 方式三：Telegram（需同时配置 Bot Token 和 Chat ID）
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          # 方式四：邮件（只需邮箱和授权码，SMTP自动识别）
           EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
           EMAIL_RECEIVERS: ${{ secrets.EMAIL_RECEIVERS }}
-          # 方式五：自定义 Webhook（支持钉钉、Discord、Slack、Bark等，多个用逗号分隔）
           CUSTOM_WEBHOOK_URLS: ${{ secrets.CUSTOM_WEBHOOK_URLS }}
-          # 方式六：飞书文档
           FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
           FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
           FEISHU_FOLDER_TOKEN: ${{ secrets.FEISHU_FOLDER_TOKEN }}
-
-          
-          # 自选股列表 (从 secrets 或使用默认值)
-          STOCK_LIST: ${{ secrets.STOCK_LIST || '600519' }}
-          
-          # 其他配置
+          STOCK_LIST: ${{ env.STOCK_LIST }}
+          # full 模式已先做板块/沙里淘金，此处强制 manual 使用上面 STOCK_LIST；非 full 时可用 vars 配置
+          STOCK_LIST_MODE: ${{ env.MODE == 'full' && 'manual' || vars.STOCK_LIST_MODE || secrets.STOCK_LIST_MODE || 'manual' }}
+          CONCEPT_BOARD_TOP_N: ${{ vars.CONCEPT_BOARD_TOP_N || secrets.CONCEPT_BOARD_TOP_N || '10' }}
+          CONCEPT_STOCKS_PER_BOARD: ${{ vars.CONCEPT_STOCKS_PER_BOARD || secrets.CONCEPT_STOCKS_PER_BOARD || '6' }}
           LOG_LEVEL: INFO
           DATA_DAYS: 60
           MAX_CONCURRENT: 3
         run: |
-          # 判断运行模式
-          MODE="${{ github.event.inputs.mode || 'full' }}"
-          
           echo "=========================================="
-          echo "运行模式: $MODE"
-          echo "自选股: $STOCK_LIST"
+          echo "运行模式: ${{ env.MODE }}"
+          echo "选股: $STOCK_LIST_MODE | 股票列表: $STOCK_LIST"
           echo "时间: $(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S')"
-          echo "BOCHA_API_KEYS 是否配置: $([ -n "$BOCHA_API_KEYS" ] && echo '是' || echo '否')"
-          echo "BOCHA_API_KEYS 长度: ${#BOCHA_API_KEYS}"
           echo "=========================================="
-          
-          if [ "$MODE" = "market-only" ]; then
+          if [ "${{ env.MODE }}" = "market-only" ]; then
             python main.py --market-review
-          elif [ "$MODE" = "stocks-only" ]; then
+          elif [ "${{ env.MODE }}" = "stocks-only" ]; then
             python main.py --no-market-review
           else
             python main.py
           fi
-      
+
+      # ========== 执行沙里淘金（报告+推送）- 仅在 market-only / stocks-only / wyckoff 时执行，full 已在前面跑过 ==========
+      - name: 执行沙里淘金（报告）
+        if: env.MODE != 'full'
+        env:
+          FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
+          LOG_LEVEL: INFO
+          WYCKOFF_ENABLED: 'true'
+          WYCKOFF_TACTIC: ${{ secrets.WYCKOFF_TACTIC || 'all' }}
+          WYCKOFF_TRADING_DAYS: ${{ secrets.WYCKOFF_TRADING_DAYS || '500' }}
+          WYCKOFF_POOL_MODE: ${{ secrets.WYCKOFF_POOL_MODE || 'board' }}
+          WYCKOFF_SYMBOLS: ${{ secrets.WYCKOFF_SYMBOLS || '' }}
+          WYCKOFF_BOARD: ${{ secrets.WYCKOFF_BOARD || 'all' }}
+          WYCKOFF_LIMIT_COUNT: ${{ secrets.WYCKOFF_LIMIT_COUNT || '500' }}
+          WYCKOFF_GROUP_POWER: ${{ secrets.WYCKOFF_GROUP_POWER || 'true' }}
+          WYCKOFF_USE_CACHE: ${{ secrets.WYCKOFF_USE_CACHE || 'true' }}
+          WYCKOFF_RESULT_LIMIT: ${{ secrets.WYCKOFF_RESULT_LIMIT || '80' }}
+        run: |
+          python wyckoff_panning.py
+
       - name: 上传分析报告
-        uses: actions/upload-artifact@v4
         if: always()
+        uses: actions/upload-artifact@v4
         with:
           name: analysis-reports-${{ github.run_number }}
           path: |
             reports/
             logs/
+            concept_stock_list.txt
+            concept_boards_summary.txt
+            wyckoff_stock_list.txt
+            wyckoff_batch_*.txt
           retention-days: 30
-      
+          if-no-files-found: ignore
+
       - name: 显示运行结果
         if: always()
         run: |
           echo "=========================================="
           echo "分析完成"
           echo "=========================================="
-          if [ -d "reports" ]; then
-            echo "生成的报告:"
-            ls -la reports/
-          fi
+          if [ -d "reports" ]; then echo "报告:"; ls -la reports/; fi
+          if [ -f "concept_stock_list.txt" ]; then echo "板块选股列表: $(wc -l < concept_stock_list.txt) 只"; fi
+          if [ -f "wyckoff_stock_list.txt" ]; then echo "沙里淘金合并: $(wc -l < wyckoff_stock_list.txt) 只"; fi
+          if ls wyckoff_batch_*.txt 1>/dev/null 2>&1; then ls wyckoff_batch_*.txt; fi

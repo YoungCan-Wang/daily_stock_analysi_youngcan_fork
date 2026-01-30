@@ -871,7 +871,76 @@ def parse_arguments() -> argparse.Namespace:
 
     parser.add_argument("--webui", action="store_true", help="启动本地配置 WebUI")
 
+    parser.add_argument(
+        "--concept-only",
+        action="store_true",
+        help="仅执行概念板块选股并写出结果（供 full 模式第一步使用），退出码 0=有股票 1=有板块无股票 2=失败",
+    )
+
     return parser.parse_args()
+
+
+def run_concept_only(config: Config) -> int:
+    """
+    仅执行概念板块选股，写出结果文件，供 full 模式第一步使用。
+
+    板块数量、每板块股票数：本地读 .env，GitHub 读 Action 传入的 env（secrets/vars）。
+    退出码：0=拿到股票列表，1=拿到板块但无具体股票（已发飞书），2=板块获取失败。
+    """
+    top_boards = config.concept_board_top_n
+    stocks_per_board = config.concept_stocks_per_board
+    output_list = os.getenv("CONCEPT_OUTPUT_LIST", "concept_stock_list.txt")
+    summary_file = "concept_boards_summary.txt"
+
+    logger.info(f"[板块选股] Top{top_boards} 板块，每板块 {stocks_per_board} 只")
+    try:
+        selector = ConceptBoardSelector(
+            top_boards=top_boards,
+            stocks_per_board=stocks_per_board,
+            sleep_min=config.akshare_sleep_min,
+            sleep_max=config.akshare_sleep_max,
+        )
+        concept_codes = selector.select()
+
+        if concept_codes:
+            Path(output_list).write_text("\n".join(concept_codes), encoding="utf-8")
+            logger.info(f"[板块选股] 成功，共 {len(concept_codes)} 只，已写入 {output_list}")
+            return 0
+
+        if selector.last_boards:
+            board_lines = [
+                "# 📌 概念板块快照（未获取到成分股）",
+                f"> Top{len(selector.last_boards)} 板块 | 生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                "",
+                "| 板块 | 涨跌幅 | 成分股数 |",
+                "|------|--------|----------|",
+            ]
+            for board in selector.last_boards:
+                name = board.get("name") or "未知"
+                change_pct = board.get("change_pct")
+                change_text = (
+                    f"{change_pct:.2f}%"
+                    if isinstance(change_pct, (int, float))
+                    else "N/A"
+                )
+                codes = selector.last_board_summary.get(name, [])
+                board_lines.append(f"| {name} | {change_text} | {len(codes)} |")
+            board_report = "\n".join(board_lines)
+            Path(summary_file).write_text(board_report, encoding="utf-8")
+            logger.info(f"[板块选股] 有板块无股票，板块摘要已写入 {summary_file}")
+            notifier = NotificationService()
+            if notifier.is_available():
+                notifier.send(
+                    "【每日股票分析】板块选股：已获取板块排行，但未获取到成分股，将执行沙里淘金。\n\n"
+                    + board_report
+                )
+            return 1
+
+        logger.warning("[板块选股] 未获取到板块，返回失败")
+        return 2
+    except Exception as e:
+        logger.exception(f"[板块选股] 执行异常: {e}")
+        return 2
 
 
 def run_market_review(
@@ -1139,6 +1208,11 @@ def main() -> int:
             logger.error(f"启动 WebUI 失败: {e}")
 
     try:
+        # 模式0: 仅板块选股（供 full 模式第一步使用）
+        if getattr(args, "concept_only", False):
+            code = run_concept_only(config)
+            return code
+
         # 模式1: 仅大盘复盘
         if args.market_review:
             logger.info("模式: 仅大盘复盘")
