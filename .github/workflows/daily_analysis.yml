@@ -122,7 +122,7 @@ jobs:
             if [ -n "$FEISHU_WEBHOOK_URL" ]; then
               curl -sS -X POST "$FEISHU_WEBHOOK_URL" \
                 -H "Content-Type: application/json" \
-                -d "{\"msg_type\":\"text\",\"content\":{\"text\":\"【每日股票分析】板块选股：成功，共 ${COUNT} 只股票，将直接执行个股分析。\"}}" || true
+                -d "{\"msg_type\":\"text\",\"content\":{\"text\":\"【每日股票分析】板块选股：成功，共 ${COUNT} 只股票，将直接执行个股分析。\\n股票代码：${STOCK_LIST}\"}}" || true
             fi
           elif [ -f wyckoff_stock_list.txt ] && [ -s wyckoff_stock_list.txt ]; then
             echo "使用沙里淘金结果"
