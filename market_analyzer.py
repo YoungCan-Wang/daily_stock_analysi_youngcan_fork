@@ -11,6 +11,7 @@
 """
 
 import logging
+import json
 import os
 import time
 from contextlib import contextmanager
@@ -79,6 +80,7 @@ class MarketOverview:
     # 板块涨幅榜
     top_sectors: List[Dict] = field(default_factory=list)  # 涨幅前5板块
     bottom_sectors: List[Dict] = field(default_factory=list)  # 跌幅前5板块
+    data_note: str = ""  # 数据来源/缓存备注
 
 
 class MarketAnalyzer:
@@ -102,6 +104,7 @@ class MarketAnalyzer:
         "sh000016": "上证50",
         "sh000300": "沪深300",
     }
+    _CACHE_FILE = "data/market_overview_cache.json"
 
     def __init__(self, search_service: Optional[SearchService] = None, analyzer=None):
         """
@@ -137,6 +140,17 @@ class MarketAnalyzer:
         # 4. 获取北向资金（可选）
         # self._get_north_flow(overview)
 
+        if self._is_overview_empty(overview):
+            cached = self._load_cached_overview()
+            if cached:
+                cached.data_note = f"数据源异常，已回退到最近一次成功缓存（日期：{cached.date}）"
+                logger.warning("[大盘] 数据为空，回退到缓存数据")
+                return cached
+            overview.data_note = "数据源异常，未命中缓存"
+            logger.warning("[大盘] 数据为空，且未命中缓存")
+            return overview
+
+        self._save_cached_overview(overview)
         return overview
 
     def get_index_snapshot(self) -> List[MarketIndex]:
@@ -181,6 +195,7 @@ class MarketAnalyzer:
     def _get_main_indices(self) -> List[MarketIndex]:
         """获取主要指数实时行情"""
         indices = []
+        results_by_code: Dict[str, MarketIndex] = {}
 
         try:
             logger.info("[大盘] 获取主要指数实时行情...")
@@ -218,13 +233,21 @@ class MarketAnalyzer:
                             index.amplitude = (
                                 (index.high - index.low) / index.prev_close * 100
                             )
-                        indices.append(index)
+                        results_by_code[code] = index
 
-                logger.info(f"[大盘] 获取到 {len(indices)} 个指数行情")
+                logger.info(f"[大盘] 获取到 {len(results_by_code)} 个指数行情 (AkShare)")
 
         except Exception as e:
             logger.error(f"[大盘] 获取指数行情失败: {e}")
 
+        # 使用 efinance 补齐缺失指数
+        missing = [c for c in self.MAIN_INDICES if c not in results_by_code]
+        if missing:
+            ef_indices = self._get_main_indices_efinance(missing)
+            for idx in ef_indices:
+                results_by_code[idx.code] = idx
+
+        indices = [results_by_code[c] for c in self.MAIN_INDICES if c in results_by_code]
         return indices
 
     def _get_market_statistics(self, overview: MarketOverview):
@@ -238,28 +261,21 @@ class MarketAnalyzer:
             )
 
             if df is not None and not df.empty:
-                # 涨跌统计
-                change_col = "涨跌幅"
-                if change_col in df.columns:
-                    df[change_col] = pd.to_numeric(df[change_col], errors="coerce")
-                    overview.up_count = len(df[df[change_col] > 0])
-                    overview.down_count = len(df[df[change_col] < 0])
-                    overview.flat_count = len(df[df[change_col] == 0])
+                applied = self._apply_market_stats_from_df(overview, df)
+                if applied:
+                    logger.info(
+                        f"[大盘] 涨:{overview.up_count} 跌:{overview.down_count} 平:{overview.flat_count} "
+                        f"涨停:{overview.limit_up_count} 跌停:{overview.limit_down_count} "
+                        f"成交额:{overview.total_amount:.0f}亿 (AkShare)"
+                    )
+                    return
 
-                    # 涨停跌停统计（涨跌幅 >= 9.9% 或 <= -9.9%）
-                    overview.limit_up_count = len(df[df[change_col] >= 9.9])
-                    overview.limit_down_count = len(df[df[change_col] <= -9.9])
-
-                # 两市成交额
-                amount_col = "成交额"
-                if amount_col in df.columns:
-                    df[amount_col] = pd.to_numeric(df[amount_col], errors="coerce")
-                    overview.total_amount = df[amount_col].sum() / 1e8  # 转为亿元
-
+            # AkShare 失败或字段不完整，回退 efinance
+            if self._apply_market_stats_from_efinance(overview):
                 logger.info(
                     f"[大盘] 涨:{overview.up_count} 跌:{overview.down_count} 平:{overview.flat_count} "
                     f"涨停:{overview.limit_up_count} 跌停:{overview.limit_down_count} "
-                    f"成交额:{overview.total_amount:.0f}亿"
+                    f"成交额:{overview.total_amount:.0f}亿 (Efinance)"
                 )
 
         except Exception as e:
@@ -276,31 +292,23 @@ class MarketAnalyzer:
             )
 
             if df is not None and not df.empty:
-                change_col = "涨跌幅"
-                if change_col in df.columns:
-                    df[change_col] = pd.to_numeric(df[change_col], errors="coerce")
-                    df = df.dropna(subset=[change_col])
-
-                    # 涨幅前5
-                    top = df.nlargest(5, change_col)
-                    overview.top_sectors = [
-                        {"name": row["板块名称"], "change_pct": row[change_col]}
-                        for _, row in top.iterrows()
-                    ]
-
-                    # 跌幅前5
-                    bottom = df.nsmallest(5, change_col)
-                    overview.bottom_sectors = [
-                        {"name": row["板块名称"], "change_pct": row[change_col]}
-                        for _, row in bottom.iterrows()
-                    ]
-
+                applied = self._apply_sector_rankings_from_df(overview, df)
+                if applied:
                     logger.info(
-                        f"[大盘] 领涨板块: {[s['name'] for s in overview.top_sectors]}"
+                        f"[大盘] 领涨板块: {[s['name'] for s in overview.top_sectors]} (AkShare)"
                     )
                     logger.info(
-                        f"[大盘] 领跌板块: {[s['name'] for s in overview.bottom_sectors]}"
+                        f"[大盘] 领跌板块: {[s['name'] for s in overview.bottom_sectors]} (AkShare)"
                     )
+                    return
+
+            if self._apply_sector_rankings_from_efinance(overview):
+                logger.info(
+                    f"[大盘] 领涨板块: {[s['name'] for s in overview.top_sectors]} (Efinance)"
+                )
+                logger.info(
+                    f"[大盘] 领跌板块: {[s['name'] for s in overview.bottom_sectors]} (Efinance)"
+                )
 
         except Exception as e:
             logger.error(f"[大盘] 获取板块涨跌榜失败: {e}")
@@ -454,6 +462,10 @@ class MarketAnalyzer:
                 snippet = n.get("snippet", "")[:100]
             news_text += f"{i}. {title}\n   {snippet}\n"
 
+        data_note_text = (
+            f"数据备注: {overview.data_note}\n\n" if overview.data_note else ""
+        )
+
         prompt = f"""你是一位专业的A股市场分析师，请根据以下数据生成一份简洁的大盘复盘报告。
 
 【重要】输出要求：
@@ -477,6 +489,7 @@ class MarketAnalyzer:
 - 涨停: {overview.limit_up_count} 家 | 跌停: {overview.limit_down_count} 家
 - 两市成交额: {overview.total_amount:.0f} 亿元
 - 北向资金: {overview.north_flow:+.2f} 亿元
+{data_note_text}
 
 ## 板块表现
 领涨: {top_sectors_text}
@@ -544,7 +557,10 @@ class MarketAnalyzer:
         top_text = "、".join([s["name"] for s in overview.top_sectors[:3]])
         bottom_text = "、".join([s["name"] for s in overview.bottom_sectors[:3]])
 
+        note_line = f"*数据备注: {overview.data_note}*\n\n" if overview.data_note else ""
         report = f"""## 📊 {overview.date} 大盘复盘
+
+{note_line}
 
 ### 一、市场总结
 今日A股市场整体呈现**{market_mood}**态势。
@@ -573,6 +589,254 @@ class MarketAnalyzer:
 *复盘时间: {datetime.now().strftime("%H:%M")}*
 """
         return report
+
+    def _pick_column(self, df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
+        for col in candidates:
+            if col in df.columns:
+                return col
+        return None
+
+    def _normalize_index_code(self, raw: object) -> str:
+        if raw is None:
+            return ""
+        s = str(raw).strip()
+        if not s:
+            return ""
+        digits = "".join(ch for ch in s if ch.isdigit())
+        if len(digits) >= 6:
+            return digits[-6:]
+        return digits
+
+    def _get_main_indices_efinance(self, missing_codes: List[str]) -> List[MarketIndex]:
+        try:
+            import efinance as ef
+        except Exception as exc:
+            logger.warning(f"[大盘] efinance 不可用，跳过指数回退: {exc}")
+            return []
+
+        try:
+            logger.info("[大盘] 尝试使用 efinance 获取指数行情...")
+            df = ef.stock.get_realtime_quotes("沪深系列指数")
+        except Exception as exc:
+            logger.warning(f"[大盘] efinance 指数行情获取失败: {exc}")
+            return []
+
+        if df is None or df.empty:
+            return []
+
+        code_col = self._pick_column(df, ["代码", "code", "股票代码"])
+        name_col = self._pick_column(df, ["名称", "name", "股票名称"])
+        price_col = self._pick_column(df, ["最新价", "最新", "最新价(元)", "最新价/元"])
+        change_col = self._pick_column(df, ["涨跌额", "涨跌", "涨跌额(元)"])
+        pct_col = self._pick_column(df, ["涨跌幅", "涨跌幅(%)", "涨跌幅%"])
+        open_col = self._pick_column(df, ["今开", "开盘", "开盘价"])
+        high_col = self._pick_column(df, ["最高", "最高价"])
+        low_col = self._pick_column(df, ["最低", "最低价"])
+        prev_col = self._pick_column(df, ["昨收", "昨收价", "前收盘价"])
+        vol_col = self._pick_column(df, ["成交量", "成交量(手)"])
+        amt_col = self._pick_column(df, ["成交额", "成交额(元)"])
+
+        if not code_col:
+            return []
+
+        missing_base = {self._normalize_index_code(c) for c in missing_codes}
+        indices: List[MarketIndex] = []
+
+        for _, row in df.iterrows():
+            code_raw = row.get(code_col)
+            code_base = self._normalize_index_code(code_raw)
+            if code_base not in missing_base:
+                continue
+
+            full_code = next((c for c in missing_codes if c.endswith(code_base)), code_base)
+            name = self.MAIN_INDICES.get(full_code, str(row.get(name_col, "")).strip())
+
+            def num(val):
+                try:
+                    return float(val)
+                except Exception:
+                    return 0.0
+
+            index = MarketIndex(
+                code=full_code,
+                name=name,
+                current=num(row.get(price_col)) if price_col else 0.0,
+                change=num(row.get(change_col)) if change_col else 0.0,
+                change_pct=num(row.get(pct_col)) if pct_col else 0.0,
+                open=num(row.get(open_col)) if open_col else 0.0,
+                high=num(row.get(high_col)) if high_col else 0.0,
+                low=num(row.get(low_col)) if low_col else 0.0,
+                prev_close=num(row.get(prev_col)) if prev_col else 0.0,
+                volume=num(row.get(vol_col)) if vol_col else 0.0,
+                amount=num(row.get(amt_col)) if amt_col else 0.0,
+            )
+            if index.prev_close > 0:
+                index.amplitude = (index.high - index.low) / index.prev_close * 100
+            indices.append(index)
+
+        return indices
+
+    def _apply_market_stats_from_df(self, overview: MarketOverview, df: pd.DataFrame) -> bool:
+        change_col = self._pick_column(df, ["涨跌幅", "涨跌幅(%)", "涨跌幅%"])
+        amount_col = self._pick_column(df, ["成交额", "成交额(元)", "成交额(亿)", "成交额(万)"])
+
+        if not change_col and not amount_col:
+            return False
+
+        if change_col and change_col in df.columns:
+            df[change_col] = pd.to_numeric(df[change_col], errors="coerce")
+            overview.up_count = len(df[df[change_col] > 0])
+            overview.down_count = len(df[df[change_col] < 0])
+            overview.flat_count = len(df[df[change_col] == 0])
+            overview.limit_up_count = len(df[df[change_col] >= 9.9])
+            overview.limit_down_count = len(df[df[change_col] <= -9.9])
+
+        if amount_col and amount_col in df.columns:
+            df[amount_col] = pd.to_numeric(df[amount_col], errors="coerce")
+            total = df[amount_col].sum()
+            if "亿" in amount_col:
+                overview.total_amount = total
+            elif "万" in amount_col:
+                overview.total_amount = total / 1e4
+            else:
+                overview.total_amount = total / 1e8
+
+        return True
+
+    def _apply_market_stats_from_efinance(self, overview: MarketOverview) -> bool:
+        try:
+            import efinance as ef
+        except Exception as exc:
+            logger.warning(f"[大盘] efinance 不可用，跳过涨跌统计回退: {exc}")
+            return False
+
+        try:
+            df = ef.stock.get_realtime_quotes("沪深A股")
+        except Exception as exc:
+            logger.warning(f"[大盘] efinance A股行情获取失败: {exc}")
+            return False
+
+        if df is None or df.empty:
+            return False
+
+        return self._apply_market_stats_from_df(overview, df)
+
+    def _apply_sector_rankings_from_df(self, overview: MarketOverview, df: pd.DataFrame) -> bool:
+        name_col = self._pick_column(df, ["板块名称", "名称", "板块", "name"])
+        change_col = self._pick_column(df, ["涨跌幅", "涨跌幅(%)", "涨跌幅%"])
+        if not name_col or not change_col:
+            return False
+
+        df = df.copy()
+        df[change_col] = pd.to_numeric(df[change_col], errors="coerce")
+        df = df.dropna(subset=[change_col])
+        if df.empty:
+            return False
+
+        top = df.nlargest(5, change_col)
+        overview.top_sectors = [
+            {"name": row[name_col], "change_pct": row[change_col]}
+            for _, row in top.iterrows()
+        ]
+
+        bottom = df.nsmallest(5, change_col)
+        overview.bottom_sectors = [
+            {"name": row[name_col], "change_pct": row[change_col]}
+            for _, row in bottom.iterrows()
+        ]
+        return True
+
+    def _apply_sector_rankings_from_efinance(self, overview: MarketOverview) -> bool:
+        try:
+            import efinance as ef
+        except Exception as exc:
+            logger.warning(f"[大盘] efinance 不可用，跳过板块回退: {exc}")
+            return False
+
+        try:
+            df = ef.stock.get_realtime_quotes("行业板块")
+        except Exception as exc:
+            logger.warning(f"[大盘] efinance 行业板块获取失败: {exc}")
+            return False
+
+        if df is None or df.empty:
+            return False
+
+        return self._apply_sector_rankings_from_df(overview, df)
+
+    def _is_overview_empty(self, overview: MarketOverview) -> bool:
+        indices_ok = len(overview.indices) > 0
+        stats_ok = any(
+            [
+                overview.up_count,
+                overview.down_count,
+                overview.flat_count,
+                overview.limit_up_count,
+                overview.limit_down_count,
+                overview.total_amount,
+            ]
+        )
+        sectors_ok = bool(overview.top_sectors or overview.bottom_sectors)
+        return not (indices_ok or stats_ok or sectors_ok)
+
+    def _save_cached_overview(self, overview: MarketOverview) -> None:
+        try:
+            data = {
+                "date": overview.date,
+                "indices": [idx.to_dict() for idx in overview.indices],
+                "up_count": overview.up_count,
+                "down_count": overview.down_count,
+                "flat_count": overview.flat_count,
+                "limit_up_count": overview.limit_up_count,
+                "limit_down_count": overview.limit_down_count,
+                "total_amount": overview.total_amount,
+                "north_flow": overview.north_flow,
+                "top_sectors": overview.top_sectors,
+                "bottom_sectors": overview.bottom_sectors,
+            }
+            os.makedirs(os.path.dirname(self._CACHE_FILE), exist_ok=True)
+            with open(self._CACHE_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False)
+        except Exception as exc:
+            logger.debug(f"[大盘] 缓存写入失败: {exc}")
+
+    def _load_cached_overview(self) -> Optional[MarketOverview]:
+        try:
+            if not os.path.exists(self._CACHE_FILE):
+                return None
+            with open(self._CACHE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            overview = MarketOverview(date=data.get("date", datetime.now().strftime("%Y-%m-%d")))
+            overview.indices = [
+                MarketIndex(
+                    code=item.get("code", ""),
+                    name=item.get("name", ""),
+                    current=float(item.get("current", 0) or 0),
+                    change=float(item.get("change", 0) or 0),
+                    change_pct=float(item.get("change_pct", 0) or 0),
+                    open=float(item.get("open", 0) or 0),
+                    high=float(item.get("high", 0) or 0),
+                    low=float(item.get("low", 0) or 0),
+                    prev_close=float(item.get("prev_close", 0) or 0),
+                    volume=float(item.get("volume", 0) or 0),
+                    amount=float(item.get("amount", 0) or 0),
+                    amplitude=float(item.get("amplitude", 0) or 0),
+                )
+                for item in data.get("indices", [])
+            ]
+            overview.up_count = int(data.get("up_count", 0) or 0)
+            overview.down_count = int(data.get("down_count", 0) or 0)
+            overview.flat_count = int(data.get("flat_count", 0) or 0)
+            overview.limit_up_count = int(data.get("limit_up_count", 0) or 0)
+            overview.limit_down_count = int(data.get("limit_down_count", 0) or 0)
+            overview.total_amount = float(data.get("total_amount", 0) or 0)
+            overview.north_flow = float(data.get("north_flow", 0) or 0)
+            overview.top_sectors = data.get("top_sectors", []) or []
+            overview.bottom_sectors = data.get("bottom_sectors", []) or []
+            return overview
+        except Exception as exc:
+            logger.debug(f"[大盘] 缓存读取失败: {exc}")
+            return None
 
     def run_daily_review(self) -> str:
         """
