@@ -152,6 +152,7 @@ class NotificationService:
 
         # 消息长度限制（字节）
         self._feishu_max_bytes = getattr(config, "feishu_max_bytes", 20000)
+        self._feishu_card_max_chars = getattr(config, "feishu_card_max_chars", 2800)
         self._wechat_max_bytes = getattr(config, "wechat_max_bytes", 4000)
 
         # 检测所有已配置的渠道
@@ -810,6 +811,18 @@ class NotificationService:
                         ]
                     )
 
+                # 文本回退模式：展示完整原始分析，避免只剩摘要
+                raw_text = result.trend_analysis or result.raw_response
+                if raw_text:
+                    report_lines.extend(
+                        [
+                            "### 📄 原始分析（模型直出）",
+                            "",
+                            raw_text,
+                            "",
+                        ]
+                    )
+
             report_lines.extend(
                 [
                     "---",
@@ -1288,12 +1301,16 @@ class NotificationService:
         current_chunk = []
         current_bytes = 0
         separator_bytes = get_bytes(separator)
+        # 预留分页标记 + JSON 包装开销，避免分片后仍被飞书裁剪
+        safe_limit = max(max_bytes - 300, 1000)
+        # 预留分页标记 + JSON 包装开销，避免明明分片后依然被飞书截断
+        safe_limit = max(max_bytes - 300, 1000)
 
         for section in sections:
             section_bytes = get_bytes(section) + separator_bytes
 
             # 如果单个 section 就超长，需要强制截断
-            if section_bytes > max_bytes:
+            if section_bytes > safe_limit:
                 # 先发送当前积累的内容
                 if current_chunk:
                     chunks.append(separator.join(current_chunk))
@@ -1301,13 +1318,13 @@ class NotificationService:
                     current_bytes = 0
 
                 # 强制截断这个超长 section（按字节截断）
-                truncated = self._truncate_to_bytes(section, max_bytes - 200)
+                truncated = self._truncate_to_bytes(section, safe_limit - 120)
                 truncated += "\n\n...(本段内容过长已截断)"
                 chunks.append(truncated)
                 continue
 
             # 检查加入后是否超长
-            if current_bytes + section_bytes > max_bytes:
+            if current_bytes + section_bytes > safe_limit:
                 # 保存当前块，开始新块
                 if current_chunk:
                     chunks.append(separator.join(current_chunk))
@@ -1525,12 +1542,14 @@ class NotificationService:
         current_chunk = []
         current_bytes = 0
         separator_bytes = get_bytes(separator)
+        # 预留分页标记 + JSON 包装开销，避免分片后仍被飞书裁剪
+        safe_limit = max(max_bytes - 300, 1000)
 
         for section in sections:
             section_bytes = get_bytes(section) + separator_bytes
 
             # 如果单个 section 就超长，需要强制截断
-            if section_bytes > max_bytes:
+            if section_bytes > safe_limit:
                 # 先发送当前积累的内容
                 if current_chunk:
                     chunks.append(separator.join(current_chunk))
@@ -1538,13 +1557,13 @@ class NotificationService:
                     current_bytes = 0
 
                 # 强制截断这个超长 section（按字节截断）
-                truncated = self._truncate_to_bytes(section, max_bytes - 200)
+                truncated = self._truncate_to_bytes(section, safe_limit - 120)
                 truncated += "\n\n...(本段内容过长已截断)"
                 chunks.append(truncated)
                 continue
 
             # 检查加入后是否超长
-            if current_bytes + section_bytes > max_bytes:
+            if current_bytes + section_bytes > safe_limit:
                 # 保存当前块，开始新块
                 if current_chunk:
                     chunks.append(separator.join(current_chunk))
@@ -1666,6 +1685,16 @@ class NotificationService:
                 logger.error(f"飞书请求失败: HTTP {response.status_code}")
                 logger.error(f"响应内容: {response.text}")
                 return False
+
+        # 长文本优先走 text，避免 lark_md 卡片元素长度限制导致内容被静默截断
+        if len(content) > self._feishu_card_max_chars:
+            logger.info(
+                f"飞书内容较长（{len(content)} 字符），优先使用 text 消息避免卡片截断"
+            )
+            text_payload = {"msg_type": "text", "content": {"text": content}}
+
+            if _post_payload(text_payload):
+                return True
 
         # 1) 优先使用交互卡片（支持 Markdown 渲染）
         card_payload = {

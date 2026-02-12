@@ -1054,52 +1054,73 @@ class GeminiAnalyzer:
     def _parse_text_response(
         self, response_text: str, code: str, name: str
     ) -> AnalysisResult:
-        """从纯文本响应中尽可能提取分析信息"""
-        # 尝试识别关键词来判断情绪
-        sentiment_score = 50
+        """从纯文本响应中提取分析信息（以模型显式结论为准）"""
+        cleaned = (response_text or "").strip()
+        lines = [ln.strip() for ln in cleaned.splitlines() if ln.strip()]
+
+        # 默认值：当模型未明确给出操作信号时，保持中性
+        advice = "观望"
         trend = "震荡"
-        advice = "持有"
 
-        text_lower = response_text.lower()
+        # 1) 优先从“决策信号”中读取（模型显式指令）
+        signal_line = ""
+        for ln in lines:
+            if "决策信号" in ln:
+                signal_line = ln
+                break
 
-        # 简单的情绪识别
-        positive_keywords = [
-            "看多",
-            "买入",
-            "上涨",
-            "突破",
-            "强势",
-            "利好",
-            "加仓",
-            "bullish",
-            "buy",
-        ]
-        negative_keywords = [
-            "看空",
-            "卖出",
-            "下跌",
-            "跌破",
-            "弱势",
-            "利空",
-            "减仓",
-            "bearish",
-            "sell",
-        ]
+        if signal_line:
+            if any(k in signal_line for k in ["🔴", "清仓", "卖出"]):
+                advice, trend = "卖出", "看空"
+            elif any(k in signal_line for k in ["⚪", "观望", "空仓"]):
+                advice, trend = "观望", "震荡"
+            elif any(k in signal_line for k in ["🟡", "等待", "确认", "持有"]):
+                advice, trend = "持有", "震荡"
+            elif any(k in signal_line for k in ["🟢", "买入", "潜伏", "加仓"]):
+                advice, trend = "买入", "看多"
 
-        positive_count = sum(1 for kw in positive_keywords if kw in text_lower)
-        negative_count = sum(1 for kw in negative_keywords if kw in text_lower)
+        # 2) 若无“决策信号”，尝试读取“操作建议”行（仍属于模型显式结论）
+        if not signal_line:
+            for ln in lines:
+                if "操作建议" in ln:
+                    if any(k in ln for k in ["卖出", "清仓", "减仓"]):
+                        advice, trend = "卖出", "看空"
+                    elif any(k in ln for k in ["买入", "加仓"]):
+                        advice, trend = "买入", "看多"
+                    elif "持有" in ln:
+                        advice, trend = "持有", "震荡"
+                    elif "观望" in ln:
+                        advice, trend = "观望", "震荡"
+                    break
 
-        if positive_count > negative_count + 1:
-            sentiment_score = 65
-            trend = "看多"
-            advice = "买入"
-        elif negative_count > positive_count + 1:
-            sentiment_score = 35
+        # 3) 仅用模型文本中的趋势词补齐 trend（不反推买卖）
+        if any(k in cleaned for k in ["强烈看空", "看空"]):
             trend = "看空"
-            advice = "卖出"
+        elif any(k in cleaned for k in ["强烈看多", "看多"]):
+            trend = "看多"
 
-        # 截取前500字符作为摘要
-        summary = response_text[:500] if response_text else "无分析结果"
+        # 根据模型显式操作映射评分（不做关键词情绪打分）
+        score_map = {"买入": 65, "持有": 55, "观望": 50, "卖出": 35}
+        sentiment_score = score_map.get(advice, 50)
+
+        # 生成“简短一句话结论”，避免把整篇报告塞进“一句话决策”
+        summary = "分析完成"
+        for ln in lines:
+            if ln.startswith("#"):
+                continue
+            if any(k in ln for k in ["决策信号", "一句话", "操作建议", "结论"]):
+                summary = ln.lstrip("*-• ")
+                break
+
+        if summary == "分析完成":
+            for ln in lines:
+                candidate = ln.lstrip("*-• ")
+                if candidate and not candidate.startswith("#"):
+                    summary = candidate
+                    break
+
+        if len(summary) > 120:
+            summary = summary[:117] + "..."
 
         return AnalysisResult(
             code=code,
@@ -1109,8 +1130,9 @@ class GeminiAnalyzer:
             operation_advice=advice,
             confidence_level="低",
             analysis_summary=summary,
-            key_points="JSON解析失败，仅供参考",
-            risk_warning="分析结果可能不准确，建议结合其他信息判断",
+            trend_analysis=cleaned,
+            key_points="文本模式解析（以模型显式结论为准）",
+            risk_warning="模型未返回结构化JSON，以下内容为原文直出，请人工复核",
             raw_response=response_text,
             success=True,
         )
