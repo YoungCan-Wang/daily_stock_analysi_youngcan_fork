@@ -152,6 +152,7 @@ class NotificationService:
 
         # 消息长度限制（字节）
         self._feishu_max_bytes = getattr(config, "feishu_max_bytes", 20000)
+        self._feishu_card_max_chars = getattr(config, "feishu_card_max_chars", 2800)
         self._wechat_max_bytes = getattr(config, "wechat_max_bytes", 4000)
 
         # 检测所有已配置的渠道
@@ -810,6 +811,18 @@ class NotificationService:
                         ]
                     )
 
+                # 文本回退模式：展示完整原始分析，避免只剩摘要
+                raw_text = result.trend_analysis or result.raw_response
+                if raw_text:
+                    report_lines.extend(
+                        [
+                            "### 📄 原始分析（模型直出）",
+                            "",
+                            raw_text,
+                            "",
+                        ]
+                    )
+
             report_lines.extend(
                 [
                     "---",
@@ -1288,12 +1301,16 @@ class NotificationService:
         current_chunk = []
         current_bytes = 0
         separator_bytes = get_bytes(separator)
+        # 预留分页标记 + JSON 包装开销，避免分片后仍被飞书裁剪
+        safe_limit = max(max_bytes - 300, 1000)
+        # 预留分页标记 + JSON 包装开销，避免明明分片后依然被飞书截断
+        safe_limit = max(max_bytes - 300, 1000)
 
         for section in sections:
             section_bytes = get_bytes(section) + separator_bytes
 
             # 如果单个 section 就超长，需要强制截断
-            if section_bytes > max_bytes:
+            if section_bytes > safe_limit:
                 # 先发送当前积累的内容
                 if current_chunk:
                     chunks.append(separator.join(current_chunk))
@@ -1301,13 +1318,13 @@ class NotificationService:
                     current_bytes = 0
 
                 # 强制截断这个超长 section（按字节截断）
-                truncated = self._truncate_to_bytes(section, max_bytes - 200)
+                truncated = self._truncate_to_bytes(section, safe_limit - 120)
                 truncated += "\n\n...(本段内容过长已截断)"
                 chunks.append(truncated)
                 continue
 
             # 检查加入后是否超长
-            if current_bytes + section_bytes > max_bytes:
+            if current_bytes + section_bytes > safe_limit:
                 # 保存当前块，开始新块
                 if current_chunk:
                     chunks.append(separator.join(current_chunk))
@@ -1504,73 +1521,96 @@ class NotificationService:
         import time
 
         def get_bytes(s: str) -> int:
-            """获取字符串的 UTF-8 字节数"""
             return len(s.encode("utf-8"))
 
-        # 智能分割：优先按 "---" 分隔（股票之间的分隔线）
-        # 如果没有分隔线，按 "### " 标题分割（每只股票的标题）
+        safe_bytes = max(max_bytes - 300, 1000)
+        safe_chars = max(getattr(self, "_feishu_card_max_chars", 2800) - 50, 500)
+
+        def split_long_section(section: str) -> List[str]:
+            """将超长 section 按行切分，尽量保留 Markdown 卡片渲染。"""
+            parts: List[str] = []
+            current = ""
+            for line in section.split("\n"):
+                candidate = current + ("\n" if current else "") + line
+                if get_bytes(candidate) > safe_bytes or len(candidate) > safe_chars:
+                    if current:
+                        parts.append(current)
+                        current = line
+                    else:
+                        # 极端单行超限，按字节安全截断
+                        cut = self._truncate_to_bytes(line, min(safe_bytes, 2000))
+                        parts.append(cut)
+                        current = line[len(cut) :].strip()
+                else:
+                    current = candidate
+            if current:
+                parts.append(current)
+            return parts
+
         if "\n---\n" in content:
             sections = content.split("\n---\n")
             separator = "\n---\n"
         elif "\n### " in content:
-            # 按 ### 分割，但保留 ### 前缀
             parts = content.split("\n### ")
             sections = [parts[0]] + [f"### {p}" for p in parts[1:]]
             separator = "\n"
         else:
-            # 无法智能分割，按行强制分割
             return self._send_feishu_force_chunked(content, max_bytes)
 
-        chunks = []
-        current_chunk = []
+        chunks: List[str] = []
+        current_chunk: List[str] = []
         current_bytes = 0
+        current_chars = 0
         separator_bytes = get_bytes(separator)
+        separator_chars = len(separator)
 
         for section in sections:
             section_bytes = get_bytes(section) + separator_bytes
+            section_chars = len(section) + separator_chars
 
-            # 如果单个 section 就超长，需要强制截断
-            if section_bytes > max_bytes:
-                # 先发送当前积累的内容
+            if section_bytes > safe_bytes or section_chars > safe_chars:
                 if current_chunk:
                     chunks.append(separator.join(current_chunk))
                     current_chunk = []
                     current_bytes = 0
+                    current_chars = 0
 
-                # 强制截断这个超长 section（按字节截断）
-                truncated = self._truncate_to_bytes(section, max_bytes - 200)
-                truncated += "\n\n...(本段内容过长已截断)"
-                chunks.append(truncated)
+                for part in split_long_section(section):
+                    chunks.append(part)
                 continue
 
-            # 检查加入后是否超长
-            if current_bytes + section_bytes > max_bytes:
-                # 保存当前块，开始新块
+            if (
+                current_bytes + section_bytes > safe_bytes
+                or current_chars + section_chars > safe_chars
+            ):
                 if current_chunk:
                     chunks.append(separator.join(current_chunk))
                 current_chunk = [section]
                 current_bytes = section_bytes
+                current_chars = section_chars
             else:
                 current_chunk.append(section)
                 current_bytes += section_bytes
+                current_chars += section_chars
 
-        # 添加最后一块
         if current_chunk:
             chunks.append(separator.join(current_chunk))
 
-        # 分批发送
         total_chunks = len(chunks)
         success_count = 0
-
         logger.info(f"飞书分批发送：共 {total_chunks} 批")
 
         for i, chunk in enumerate(chunks):
-            # 添加分页标记
-            if total_chunks > 1:
-                page_marker = f"\n\n📄 ({i + 1}/{total_chunks})"
-                chunk_with_marker = chunk + page_marker
-            else:
-                chunk_with_marker = chunk
+            page_marker = f"\n\n📄 ({i + 1}/{total_chunks})" if total_chunks > 1 else ""
+            chunk_with_marker = chunk + page_marker
+
+            if (
+                len(chunk_with_marker.encode("utf-8")) > safe_bytes
+                or len(chunk_with_marker) > safe_chars
+            ):
+                chunk_with_marker = self._truncate_to_bytes(
+                    chunk_with_marker, min(safe_bytes, 2000)
+                )
 
             try:
                 if self._send_feishu_message(chunk_with_marker):
@@ -1581,7 +1621,6 @@ class NotificationService:
             except Exception as e:
                 logger.error(f"飞书第 {i + 1}/{total_chunks} 批发送异常: {e}")
 
-            # 批次间隔，避免触发频率限制
             if i < total_chunks - 1:
                 time.sleep(1)
 
@@ -1589,7 +1628,7 @@ class NotificationService:
 
     def _send_feishu_force_chunked(self, content: str, max_bytes: int) -> bool:
         """
-        强制按字节分割发送（无法智能分割时的 fallback）
+        强制按字节/字符分割发送（无法智能分割时的 fallback）
 
         Args:
             content: 完整消息内容
@@ -1597,15 +1636,16 @@ class NotificationService:
         """
         import time
 
+        safe_bytes = max(max_bytes - 300, 1000)
+        safe_chars = max(getattr(self, "_feishu_card_max_chars", 2800) - 50, 500)
+
         chunks = []
         current_chunk = ""
-
-        # 按行分割，确保不会在多字节字符中间截断
         lines = content.split("\n")
 
         for line in lines:
             test_chunk = current_chunk + ("\n" if current_chunk else "") + line
-            if len(test_chunk.encode("utf-8")) > max_bytes - 100:  # 预留空间给分页标记
+            if len(test_chunk.encode("utf-8")) > safe_bytes or len(test_chunk) > safe_chars:
                 if current_chunk:
                     chunks.append(current_chunk)
                 current_chunk = line
@@ -1622,9 +1662,13 @@ class NotificationService:
 
         for i, chunk in enumerate(chunks):
             page_marker = f"\n\n📄 ({i + 1}/{total_chunks})" if total_chunks > 1 else ""
+            payload_chunk = chunk + page_marker
+
+            if len(payload_chunk.encode("utf-8")) > safe_bytes or len(payload_chunk) > safe_chars:
+                payload_chunk = self._truncate_to_bytes(payload_chunk, min(safe_bytes, 2000))
 
             try:
-                if self._send_feishu_message(chunk + page_marker):
+                if self._send_feishu_message(payload_chunk):
                     success_count += 1
             except Exception as e:
                 logger.error(f"飞书第 {i + 1}/{total_chunks} 批发送异常: {e}")
@@ -1633,6 +1677,7 @@ class NotificationService:
                 time.sleep(1)
 
         return success_count == total_chunks
+
 
     def _send_feishu_message(self, content: str) -> bool:
         """发送单条飞书消息（优先使用 Markdown 卡片）"""
