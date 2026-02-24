@@ -97,7 +97,7 @@ class Config:
 
     # 消息长度限制（字节）- 超长自动分批发送
     feishu_max_bytes: int = 20000  # 飞书限制约 20KB，默认 20000 字节
-    feishu_card_max_chars: int = 2800  # 飞书卡片 lark_md 单片建议字符上限（用于分片）
+    feishu_card_max_chars: int = 2800  # 飞书卡片 lark_md 文本建议上限，超出走 text
     wechat_max_bytes: int = 4000  # 企业微信限制 4096 字节，默认 4000 字节
 
     # === 数据库配置 ===
