@@ -296,7 +296,8 @@ class NotificationService:
         )
 
         # 逐个股票的详细分析
-        for result in sorted_results:
+        total_stocks = len(sorted_results)
+        for idx, result in enumerate(sorted_results, 1):
             emoji = result.get_emoji()
             confidence_stars = (
                 result.get_confidence_stars()
@@ -306,7 +307,7 @@ class NotificationService:
 
             report_lines.extend(
                 [
-                    f"### {emoji} {result.name} ({result.code})",
+                    f"### ({idx}/{total_stocks}) {emoji} {result.name} ({result.code})",
                     "",
                     f"**操作建议：{result.operation_advice}** | **综合评分：{result.sentiment_score}分** | **趋势预测：{result.trend_prediction}** | **置信度：{confidence_stars}**",
                     "",
@@ -542,7 +543,8 @@ class NotificationService:
         ]
 
         # 逐个股票的决策仪表盘
-        for result in sorted_results:
+        total_stocks = len(sorted_results)
+        for idx, result in enumerate(sorted_results, 1):
             signal_text, signal_emoji, signal_tag = self._get_signal_level(result)
             dashboard = (
                 result.dashboard
@@ -559,7 +561,7 @@ class NotificationService:
 
             report_lines.extend(
                 [
-                    f"## {signal_emoji} {stock_name} ({result.code})",
+                    f"## ({idx}/{total_stocks}) {signal_emoji} {stock_name} ({result.code})",
                     "",
                 ]
             )
@@ -870,7 +872,8 @@ class NotificationService:
             "",
         ]
 
-        for result in sorted_results:
+        total_stocks = len(sorted_results)
+        for idx, result in enumerate(sorted_results, 1):
             signal_text, signal_emoji, _ = self._get_signal_level(result)
             dashboard = (
                 result.dashboard
@@ -890,7 +893,7 @@ class NotificationService:
 
             # 标题行：信号等级 + 股票名称
             lines.append(
-                f"### {signal_emoji} **{signal_text}** | {stock_name}({result.code})"
+                f"### ({idx}/{total_stocks}) {signal_emoji} **{signal_text}** | {stock_name}({result.code})"
             )
             lines.append("")
 
@@ -1035,11 +1038,12 @@ class NotificationService:
         ]
 
         # 每只股票精简信息（控制长度）
-        for result in sorted_results:
+        total_stocks = len(sorted_results)
+        for idx, result in enumerate(sorted_results, 1):
             emoji = result.get_emoji()
 
             # 核心信息行
-            lines.append(f"### {emoji} {result.name}({result.code})")
+            lines.append(f"### ({idx}/{total_stocks}) {emoji} {result.name}({result.code})")
             lines.append(
                 f"**{result.operation_advice}** | 评分:{result.sentiment_score} | {result.trend_prediction}"
             )
@@ -1490,12 +1494,14 @@ class NotificationService:
         formatted_content = self._format_feishu_markdown(content)
 
         max_bytes = self._feishu_max_bytes  # 从配置读取，默认 20000 字节
+        max_chars = max(getattr(self, "_feishu_card_max_chars", 2800) - 50, 500)
 
-        # 检查字节长度，超长则分批发送
+        # 卡片模式同时受字节和字符长度影响，任一超限都分批
         content_bytes = len(formatted_content.encode("utf-8"))
-        if content_bytes > max_bytes:
+        content_chars = len(formatted_content)
+        if content_bytes > max_bytes or content_chars > max_chars:
             logger.info(
-                f"飞书消息内容超长({content_bytes}字节/{len(content)}字符)，将分批发送"
+                f"飞书消息内容超长({content_bytes}字节/{content_chars}字符)，将分批发送"
             )
             return self._send_feishu_chunked(formatted_content, max_bytes)
 
@@ -1617,11 +1623,23 @@ class NotificationService:
                 )
 
             try:
-                if self._send_feishu_message(chunk_with_marker):
-                    success_count += 1
-                    logger.info(f"飞书第 {i + 1}/{total_chunks} 批发送成功")
+                if (
+                    len(chunk_with_marker.encode("utf-8")) > safe_bytes
+                    or len(chunk_with_marker) > safe_chars
+                ):
+                    logger.warning(
+                        f"飞书第 {i + 1}/{total_chunks} 批仍超限，转为强制分片发送"
+                    )
+                    if self._send_feishu_force_chunked(chunk_with_marker, max_bytes):
+                        success_count += 1
+                    else:
+                        logger.error(f"飞书第 {i + 1}/{total_chunks} 批强制分片发送失败")
                 else:
-                    logger.error(f"飞书第 {i + 1}/{total_chunks} 批发送失败")
+                    if self._send_feishu_message(chunk_with_marker):
+                        success_count += 1
+                        logger.info(f"飞书第 {i + 1}/{total_chunks} 批发送成功")
+                    else:
+                        logger.error(f"飞书第 {i + 1}/{total_chunks} 批发送失败")
             except Exception as e:
                 logger.error(f"飞书第 {i + 1}/{total_chunks} 批发送异常: {e}")
 
