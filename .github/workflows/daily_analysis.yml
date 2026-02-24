@@ -119,10 +119,11 @@ jobs:
             STOCK_LIST=$(paste -sd, concept_stock_list.txt)
             echo "STOCK_LIST=$STOCK_LIST" >> $GITHUB_ENV
             COUNT=$(wc -l < concept_stock_list.txt)
+            STOCK_LIST_PRETTY=$(awk 'BEGIN{ORS=""} {if(NR>1){if((NR-1)%6==0) printf "\n"; else printf ","} printf $0}' concept_stock_list.txt | sed ':a;N;$!ba;s/\n/\\n/g')
             if [ -n "$FEISHU_WEBHOOK_URL" ]; then
               curl -sS -X POST "$FEISHU_WEBHOOK_URL" \
                 -H "Content-Type: application/json" \
-                -d "{\"msg_type\":\"text\",\"content\":{\"text\":\"【每日股票分析】板块选股：成功，共 ${COUNT} 只股票，将直接执行个股分析。\\n股票代码：${STOCK_LIST}\"}}" || true
+                -d "{\"msg_type\":\"text\",\"content\":{\"text\":\"【每日股票分析】板块选股：成功，共 ${COUNT} 只股票，将直接执行个股分析。\\n股票代码：\\n${STOCK_LIST_PRETTY}\"}}" || true
             fi
           elif [ -f wyckoff_stock_list.txt ] && [ -s wyckoff_stock_list.txt ]; then
             echo "使用沙里淘金结果"

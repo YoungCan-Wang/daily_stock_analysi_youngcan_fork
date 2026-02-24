@@ -97,6 +97,7 @@ class Config:
 
     # 消息长度限制（字节）- 超长自动分批发送
     feishu_max_bytes: int = 20000  # 飞书限制约 20KB，默认 20000 字节
+    feishu_card_max_chars: int = 2800  # 飞书卡片 lark_md 单片建议字符上限（用于分片）
     wechat_max_bytes: int = 4000  # 企业微信限制 4096 字节，默认 4000 字节
 
     # === 数据库配置 ===
@@ -229,6 +230,7 @@ class Config:
             single_stock_notify=os.getenv("SINGLE_STOCK_NOTIFY", "false").lower()
             == "true",
             feishu_max_bytes=int(os.getenv("FEISHU_MAX_BYTES", "20000")),
+            feishu_card_max_chars=int(os.getenv("FEISHU_CARD_MAX_CHARS", "2800")),
             wechat_max_bytes=int(os.getenv("WECHAT_MAX_BYTES", "4000")),
             database_path=os.getenv("DATABASE_PATH", "./data/stock_analysis.db"),
             log_dir=os.getenv("LOG_DIR", "./logs"),
