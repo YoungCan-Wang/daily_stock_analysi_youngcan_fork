@@ -808,7 +808,7 @@ def _load_env_config() -> Dict[str, object]:
         "trading_days": _get_int("WYCKOFF_TRADING_DAYS", 500),
         "pool_mode": _get_str("WYCKOFF_POOL_MODE", "board"),
         "symbols": _get_str("WYCKOFF_SYMBOLS", ""),
-        "board": _get_str("WYCKOFF_BOARD", "all"),
+        "board": _get_str("WYCKOFF_BOARD", "main,chinext"),  # 默认排除科创板(star)、北交所(bse)
         "limit_count": _get_int("WYCKOFF_LIMIT_COUNT", 500),
         "offset": _get_int("WYCKOFF_OFFSET", 0),
         "group_power": _get_bool("WYCKOFF_GROUP_POWER", True),

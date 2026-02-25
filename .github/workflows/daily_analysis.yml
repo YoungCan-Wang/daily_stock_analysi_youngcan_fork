@@ -212,7 +212,7 @@ jobs:
           WYCKOFF_TRADING_DAYS: ${{ secrets.WYCKOFF_TRADING_DAYS || '500' }}
           WYCKOFF_POOL_MODE: ${{ secrets.WYCKOFF_POOL_MODE || 'board' }}
           WYCKOFF_SYMBOLS: ${{ secrets.WYCKOFF_SYMBOLS || '' }}
-          WYCKOFF_BOARD: ${{ secrets.WYCKOFF_BOARD || 'all' }}
+          WYCKOFF_BOARD: ${{ secrets.WYCKOFF_BOARD || 'main,chinext' }}
           WYCKOFF_LIMIT_COUNT: ${{ secrets.WYCKOFF_LIMIT_COUNT || '500' }}
           WYCKOFF_GROUP_POWER: ${{ secrets.WYCKOFF_GROUP_POWER || 'true' }}
           WYCKOFF_USE_CACHE: ${{ secrets.WYCKOFF_USE_CACHE || 'true' }}
