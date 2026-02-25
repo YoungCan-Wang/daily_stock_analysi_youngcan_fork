@@ -157,6 +157,8 @@ class ConceptBoardSelector:
             code = self._normalize_code(raw)
             if not code:
                 continue
+            if self._is_excluded_board(code):
+                continue
             if code in selected_set:
                 continue
             if code in selected:
@@ -179,6 +181,17 @@ class ConceptBoardSelector:
             if col in df.columns:
                 return col
         return None
+
+    @staticmethod
+    def _is_excluded_board(code: str) -> bool:
+        """是否属于科创板或北交所（排除）"""
+        if not code or len(code) < 6:
+            return False
+        if code.startswith("688"):  # 科创板
+            return True
+        if code.startswith(("43", "83", "87", "88", "92")):  # 北交所
+            return True
+        return False
 
     @staticmethod
     def _normalize_code(raw: object) -> Optional[str]:
