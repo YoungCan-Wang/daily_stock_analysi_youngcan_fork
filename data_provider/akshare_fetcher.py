@@ -1069,13 +1069,28 @@ class AkshareFetcher(BaseFetcher):
 
     def get_concept_board_rankings(self) -> Optional[pd.DataFrame]:
         """
-        获取概念板块涨跌排行
+        获取概念板块涨跌排行（按涨跌幅排序，优先使用含行情的数据源）
 
-        数据来源：ak.stock_board_concept_name_em()
+        数据来源：stock_board_concept_spot_em（有涨跌幅）或 name_em/name_ths
         """
         import akshare as ak
 
         source = os.getenv("CONCEPT_BOARD_SOURCE", "auto").strip().lower()
+
+        # auto 模式优先尝试 spot_em（含涨跌幅，可按涨幅排序）
+        if source in ("auto", "em"):
+            try:
+                self._set_random_user_agent()
+                self._enforce_rate_limit()
+                logger.info("[API调用] ak.stock_board_concept_spot_em() 获取概念板块行情（含涨跌幅）...")
+                with self._proxy_disabled():
+                    df = ak.stock_board_concept_spot_em()
+                if df is not None and not df.empty:
+                    logger.info(f"[API返回] stock_board_concept_spot_em 成功: 返回 {len(df)} 个板块")
+                    return df
+            except Exception as e:
+                logger.warning(f"[API调用] stock_board_concept_spot_em 失败: {e}，回退到 name_em")
+
         if source == "ths":
             logger.info("[API调用] 使用同花顺概念板块排行 (CONCEPT_BOARD_SOURCE=ths)")
             try:

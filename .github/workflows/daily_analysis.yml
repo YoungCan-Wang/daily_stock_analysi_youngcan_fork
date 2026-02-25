@@ -44,9 +44,12 @@ jobs:
 
       - name: 设置运行模式
         id: set_mode
+        env:
+          ALWAYS_RUN_WYCKOFF: ${{ secrets.ALWAYS_RUN_WYCKOFF || 'false' }}
         run: |
           MODE="${{ github.event.inputs.mode || 'full' }}"
           echo "MODE=$MODE" >> $GITHUB_ENV
+          echo "ALWAYS_RUN_WYCKOFF=${ALWAYS_RUN_WYCKOFF}" >> $GITHUB_ENV
           echo "运行模式: $MODE"
 
       # ========== full 模式 1：先尝试板块选股（GitHub 用 secrets，本地用 .env）==========
@@ -55,8 +58,8 @@ jobs:
         if: env.MODE == 'full'
         env:
           FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
-          CONCEPT_BOARD_TOP_N: ${{ secrets.CONCEPT_BOARD_TOP_N || '3' }}
-          CONCEPT_STOCKS_PER_BOARD: ${{ secrets.CONCEPT_STOCKS_PER_BOARD || '2' }}
+          CONCEPT_BOARD_TOP_N: ${{ secrets.CONCEPT_BOARD_TOP_N || '10' }}
+          CONCEPT_STOCKS_PER_BOARD: ${{ secrets.CONCEPT_STOCKS_PER_BOARD || '6' }}
         run: |
           python main.py --concept-only
           CONCEPT_EXIT=$?
@@ -64,9 +67,9 @@ jobs:
           echo "板块选股退出码: $CONCEPT_EXIT (0=有股票 1=有板块无股票 2=失败)"
           exit 0
 
-      # ========== full 模式 2：板块无股票或失败时，执行沙里淘金（分批，超时 2h）==========
+      # ========== full 模式 2：板块无股票/失败时执行沙里淘金；或 ALWAYS_RUN_WYCKOFF=true 时也执行 ==========
       - name: 执行沙里淘金（分批获取股票列表）
-        if: env.MODE == 'full' && env.CONCEPT_EXIT != '0'
+        if: env.MODE == 'full' && (env.CONCEPT_EXIT != '0' || env.ALWAYS_RUN_WYCKOFF == 'true')
         timeout-minutes: 120
         continue-on-error: true
         env:
@@ -98,7 +101,7 @@ jobs:
 
       # ========== full 模式：合并沙里淘金结果（去重）==========
       - name: 合并沙里淘金结果
-        if: env.MODE == 'full' && env.CONCEPT_EXIT != '0'
+        if: env.MODE == 'full' && (env.CONCEPT_EXIT != '0' || env.ALWAYS_RUN_WYCKOFF == 'true')
         run: |
           cat wyckoff_batch_*.txt 2>/dev/null | sort -u > wyckoff_stock_list.txt || true
           if [ -s wyckoff_stock_list.txt ]; then
@@ -107,14 +110,27 @@ jobs:
             echo "无有效批次结果"
           fi
 
-      # ========== full 模式：确定 STOCK_LIST（板块成功用板块列表，否则用沙里淘金或回退），成功/失败都发飞书 ==========
+      # ========== full 模式：确定 STOCK_LIST（板块/沙里淘金/合并/回退），成功/失败都发飞书 ==========
       - name: 确定股票列表（full 模式）
         if: env.MODE == 'full'
         env:
           FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
           STOCK_LIST_FALLBACK: ${{ secrets.STOCK_LIST || '600519' }}
         run: |
-          if [ -f concept_stock_list.txt ] && [ -s concept_stock_list.txt ]; then
+          # 若板块+沙里淘金均有结果，合并去重（板块优先）
+          if [ -f concept_stock_list.txt ] && [ -s concept_stock_list.txt ] && [ -f wyckoff_stock_list.txt ] && [ -s wyckoff_stock_list.txt ]; then
+            echo "使用板块+沙里淘金合并结果"
+            (cat concept_stock_list.txt wyckoff_stock_list.txt | sort -u) > merged_stock_list.txt
+            STOCK_LIST=$(paste -sd, merged_stock_list.txt)
+            echo "STOCK_LIST=$STOCK_LIST" >> $GITHUB_ENV
+            TOTAL=$(wc -l < merged_stock_list.txt)
+            STOCK_LIST_PRETTY=$(awk 'BEGIN{ORS=""} {if(NR>1){if((NR-1)%6==0) printf "\\n"; else printf ","} printf $0}' merged_stock_list.txt)
+            if [ -n "$FEISHU_WEBHOOK_URL" ]; then
+              curl -sS -X POST "$FEISHU_WEBHOOK_URL" \
+                -H "Content-Type: application/json" \
+                -d "{\"msg_type\":\"text\",\"content\":{\"text\":\"【每日股票分析】板块+沙里淘金合并：共 ${TOTAL} 只股票（去重），将执行个股分析。\\n股票代码：\\n${STOCK_LIST_PRETTY}\"}}" || true
+            fi
+          elif [ -f concept_stock_list.txt ] && [ -s concept_stock_list.txt ]; then
             echo "使用板块选股结果"
             STOCK_LIST=$(paste -sd, concept_stock_list.txt)
             echo "STOCK_LIST=$STOCK_LIST" >> $GITHUB_ENV

@@ -87,13 +87,25 @@ class ConceptBoardSelector:
         code_col = self._pick_column(df, ["板块代码", "概念代码", "代码", "code"])
 
         change_col = self._pick_column(
-            df, ["涨跌幅", "涨跌幅(%)", "涨跌幅%", "涨跌幅(%)"]
+            df,
+            [
+                "涨跌幅",
+                "涨跌幅(%)",
+                "涨跌幅%",
+                "涨幅",
+                "日涨跌幅",
+            ],
         )
         if change_col:
             df = df.copy()
             df[change_col] = pd.to_numeric(df[change_col], errors="coerce")
             df = df.dropna(subset=[change_col])
             df = df.sort_values(by=change_col, ascending=False)
+            logger.info(f"[板块选股] 按 {change_col} 降序排序，取 Top{top_n} 板块")
+        else:
+            logger.warning(
+                "[板块选股] 未找到涨跌幅列，板块顺序可能为 API 默认（非按涨幅/资金热度）"
+            )
 
         top_df = df.head(max(top_n, 0))
         boards = []
