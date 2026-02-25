@@ -1,9 +1,9 @@
 name: 每日股票分析
 
 on:
-  # 定时触发 - 每天北京时间 18:00 (UTC 10:00)
+  # 定时触发 - 每天北京时间 17:00 (UTC 09:00)
   schedule:
-    - cron: '0 10 * * 1-5'  # 周一到周五，UTC 10:00 = 北京时间 18:00
+    - cron: '0 9 * * 1-5'  # 周一到周五，UTC 09:00 = 北京时间 17:00
 
   # 手动触发
   workflow_dispatch:
@@ -119,10 +119,11 @@ jobs:
             STOCK_LIST=$(paste -sd, concept_stock_list.txt)
             echo "STOCK_LIST=$STOCK_LIST" >> $GITHUB_ENV
             COUNT=$(wc -l < concept_stock_list.txt)
+            STOCK_LIST_PRETTY=$(awk 'BEGIN{ORS=""} {if(NR>1){if((NR-1)%6==0) printf "\\n"; else printf ","} printf $0}' concept_stock_list.txt)
             if [ -n "$FEISHU_WEBHOOK_URL" ]; then
               curl -sS -X POST "$FEISHU_WEBHOOK_URL" \
                 -H "Content-Type: application/json" \
-                -d "{\"msg_type\":\"text\",\"content\":{\"text\":\"【每日股票分析】板块选股：成功，共 ${COUNT} 只股票，将直接执行个股分析。\\n股票代码：${STOCK_LIST}\"}}" || true
+                -d "{\"msg_type\":\"text\",\"content\":{\"text\":\"【每日股票分析】板块选股：成功，共 ${COUNT} 只股票，将直接执行个股分析。\\n股票代码：\\n${STOCK_LIST_PRETTY}\"}}" || true
             fi
           elif [ -f wyckoff_stock_list.txt ] && [ -s wyckoff_stock_list.txt ]; then
             echo "使用沙里淘金结果"

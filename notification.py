@@ -1289,6 +1289,8 @@ class NotificationService:
 
         # 智能分割：优先按 "---" 分隔（股票之间的分隔线）
         # 如果没有分隔线，按 "### " 标题分割（每只股票的标题）
+        # 提前初始化，避免静态检查误判局部变量未定义
+        separator = "\n"
         if "\n---\n" in content:
             sections = content.split("\n---\n")
             separator = "\n---\n"
@@ -1553,6 +1555,11 @@ class NotificationService:
                 parts.append(current)
             return parts
 
+<<<<<<< ours
+=======
+        # 提前初始化，避免静态检查误判局部变量未定义
+        separator = "\n"
+>>>>>>> theirs
         if "\n---\n" in content:
             sections = content.split("\n---\n")
             separator = "\n---\n"
@@ -1568,22 +1575,31 @@ class NotificationService:
         current_bytes = 0
         current_chars = 0
         separator_bytes = get_bytes(separator)
+<<<<<<< ours
         # 预留分页标记 + JSON 包装开销，避免分片后仍被飞书裁剪
         safe_limit = max(max_bytes - 300, 1000)
+=======
+        separator_chars = len(separator)
+>>>>>>> theirs
 
         for section in sections:
             section_bytes = get_bytes(section) + separator_bytes
             section_chars = len(section) + separator_chars
 
+<<<<<<< ours
             # 如果单个 section 就超长，需要强制截断
             if section_bytes > safe_limit:
                 # 先发送当前积累的内容
+=======
+            if section_bytes > safe_bytes or section_chars > safe_chars:
+>>>>>>> theirs
                 if current_chunk:
                     chunks.append(separator.join(current_chunk))
                     current_chunk = []
                     current_bytes = 0
                     current_chars = 0
 
+<<<<<<< ours
                 # 强制截断这个超长 section（按字节截断）
                 truncated = self._truncate_to_bytes(section, safe_limit - 120)
                 truncated += "\n\n...(本段内容过长已截断)"
@@ -1593,6 +1609,16 @@ class NotificationService:
             # 检查加入后是否超长
             if current_bytes + section_bytes > safe_limit:
                 # 保存当前块，开始新块
+=======
+                for part in split_long_section(section):
+                    chunks.append(part)
+                continue
+
+            if (
+                current_bytes + section_bytes > safe_bytes
+                or current_chars + section_chars > safe_chars
+            ):
+>>>>>>> theirs
                 if current_chunk:
                     chunks.append(separator.join(current_chunk))
                 current_chunk = [section]
@@ -1613,6 +1639,7 @@ class NotificationService:
         for i, chunk in enumerate(chunks):
             page_marker = f"\n\n📄 ({i + 1}/{total_chunks})" if total_chunks > 1 else ""
             chunk_with_marker = chunk + page_marker
+<<<<<<< ours
 
             if (
                 len(chunk_with_marker.encode("utf-8")) > safe_bytes
@@ -1621,6 +1648,8 @@ class NotificationService:
                 chunk_with_marker = self._truncate_to_bytes(
                     chunk_with_marker, min(safe_bytes, 2000)
                 )
+=======
+>>>>>>> theirs
 
             try:
                 if (
@@ -1687,7 +1716,13 @@ class NotificationService:
             payload_chunk = chunk + page_marker
 
             if len(payload_chunk.encode("utf-8")) > safe_bytes or len(payload_chunk) > safe_chars:
+<<<<<<< ours
                 payload_chunk = self._truncate_to_bytes(payload_chunk, min(safe_bytes, 2000))
+=======
+                # 理论上不应到这里；若到达说明存在极端超长单行，截断并提示
+                logger.warning(f"飞书第 {i + 1}/{total_chunks} 批存在极端超长行，已做保护性截断")
+                payload_chunk = self._truncate_to_bytes(payload_chunk, min(safe_bytes, 4000))
+>>>>>>> theirs
 
             try:
                 if self._send_feishu_message(payload_chunk):
