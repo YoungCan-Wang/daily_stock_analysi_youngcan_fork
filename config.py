@@ -33,6 +33,7 @@ class Config:
     stock_list_mode: str = "manual"  # manual | concept
     concept_board_top_n: int = 10
     concept_stocks_per_board: int = 6
+    max_stock_count: int = 32  # 单次分析最大个股数量
 
     # === 飞书云文档配置 ===
     feishu_app_id: Optional[str] = None
@@ -190,6 +191,7 @@ class Config:
             stock_list_mode=os.getenv("STOCK_LIST_MODE", "manual").strip().lower(),
             concept_board_top_n=int(os.getenv("CONCEPT_BOARD_TOP_N", "10")),
             concept_stocks_per_board=int(os.getenv("CONCEPT_STOCKS_PER_BOARD", "6")),
+            max_stock_count=int(os.getenv("MAX_STOCK_COUNT", "32")),
             feishu_app_id=os.getenv("FEISHU_APP_ID"),
             feishu_app_secret=os.getenv("FEISHU_APP_SECRET"),
             feishu_folder_token=os.getenv("FEISHU_FOLDER_TOKEN"),

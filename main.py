@@ -32,6 +32,7 @@ if os.getenv("GITHUB_ACTIONS") != "true":
     pass
 
 import argparse
+import json
 import logging
 import sys
 import time
@@ -164,6 +165,8 @@ class StockAnalysisPipeline:
 
         self.market_snapshot: List = []
         self.market_context: Dict[str, Any] = {}
+        self.market_summary: str = ""
+        self.wyckoff_signals: Dict[str, Dict[str, Any]] = {}
 
         # 初始化搜索服务
         self.search_service = SearchService(
@@ -413,28 +416,21 @@ class StockAnalysisPipeline:
             except Exception as e:
                 logger.warning(f"[{code}] 趋势分析失败: {e}")
 
-            # Step 4: 多维度情报搜索（最新消息+风险排查+业绩预期）
+            # Step 4: 多维度情报搜索（含免费舆情兜底）
             news_context = None
-            if self.search_service.is_available:
-                logger.info(f"[{code}] 开始多维度情报搜索...")
-
-                # 使用多维度搜索（最多3次搜索）
-                intel_results = self.search_service.search_comprehensive_intel(
-                    stock_code=code, stock_name=stock_name, max_searches=3
+            logger.info(f"[{code}] 开始多维度情报搜索...")
+            intel_results = self.search_service.search_comprehensive_intel(
+                stock_code=code, stock_name=stock_name, max_searches=3
+            )
+            if intel_results:
+                news_context = self.search_service.format_intel_report(
+                    intel_results, stock_name
                 )
-
-                # 格式化情报报告
-                if intel_results:
-                    news_context = self.search_service.format_intel_report(
-                        intel_results, stock_name
-                    )
-                    total_results = sum(
-                        len(r.results) for r in intel_results.values() if r.success
-                    )
-                    logger.info(f"[{code}] 情报搜索完成: 共 {total_results} 条结果")
-                    logger.debug(f"[{code}] 情报搜索结果:\n{news_context}")
-            else:
-                logger.info(f"[{code}] 搜索服务不可用，跳过情报搜索")
+                total_results = sum(
+                    len(r.results) for r in intel_results.values() if r.success
+                )
+                logger.info(f"[{code}] 情报搜索完成: 共 {total_results} 条结果")
+                logger.debug(f"[{code}] 情报搜索结果:\n{news_context}")
 
             # Step 5: 获取分析上下文（技术面数据）
             context = self.db.get_analysis_context(code)
@@ -443,13 +439,16 @@ class StockAnalysisPipeline:
                 logger.warning(f"[{code}] 无法获取分析上下文，跳过分析")
                 return None
 
-            # Step 6: 增强上下文数据（添加实时行情、筹码、趋势分析结果、股票名称）
+            # Step 6: 增强上下文（含威科夫信号、大盘结论等）
+            wyckoff_signal = getattr(self, "wyckoff_signals", {}).get(code)
             enhanced_context = self._enhance_context(
                 context,
                 realtime_quote,
                 chip_data,
                 trend_result,
-                stock_name,  # 传入股票名称
+                stock_name,
+                market_summary=getattr(self, "market_summary", ""),
+                wyckoff_signal=wyckoff_signal,
             )
 
             # Step 7: 调用 AI 分析（传入增强的上下文和新闻）
@@ -469,6 +468,8 @@ class StockAnalysisPipeline:
         chip_data: Optional[ChipDistribution],
         trend_result: Optional[TrendAnalysisResult],
         stock_name: str = "",
+        market_summary: str = "",
+        wyckoff_signal: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         增强分析上下文
@@ -550,6 +551,10 @@ class StockAnalysisPipeline:
 
         if self.market_context:
             enhanced["market"] = self.market_context
+        if market_summary:
+            enhanced["market_summary"] = market_summary
+        if wyckoff_signal:
+            enhanced["wyckoff_signal"] = wyckoff_signal
 
         return enhanced
 
@@ -642,6 +647,8 @@ class StockAnalysisPipeline:
         stock_codes: Optional[List[str]] = None,
         dry_run: bool = False,
         send_notification: bool = True,
+        market_summary: str = "",
+        wyckoff_signals: Optional[Dict[str, Dict[str, Any]]] = None,
     ) -> List[AnalysisResult]:
         """
         运行完整的分析流程
@@ -670,6 +677,9 @@ class StockAnalysisPipeline:
         if not stock_codes:
             logger.error("未配置自选股列表，请在 .env 文件中设置 STOCK_LIST")
             return []
+
+        self.market_summary = market_summary or ""
+        self.wyckoff_signals = wyckoff_signals or {}
 
         logger.info(f"===== 开始分析 {len(stock_codes)} 只股票 =====")
         logger.info(f"股票列表: {', '.join(stock_codes)}")
@@ -1054,14 +1064,23 @@ def resolve_stock_codes(
                 logger.info("[通知] 未配置通知渠道，跳过板块快照推送")
 
         if concept_codes:
+            max_count = getattr(config, "max_stock_count", 32)
+            if len(concept_codes) > max_count:
+                concept_codes = concept_codes[:max_count]
+                logger.info(f"[选股] 概念板块截断至 {max_count} 只")
             logger.info(f"[选股] 概念板块选出 {len(concept_codes)} 只股票")
             return concept_codes
 
         logger.warning("概念板块选股为空，回退到 STOCK_LIST")
 
     config.refresh_stock_list()
-    logger.info(f"[选股] STOCK_LIST 共 {len(config.stock_list)} 只")
-    return config.stock_list
+    codes = config.stock_list
+    max_count = getattr(config, "max_stock_count", 32)
+    if len(codes) > max_count:
+        codes = codes[:max_count]
+        logger.info(f"[选股] STOCK_LIST 截断至 {max_count} 只")
+    logger.info(f"[选股] STOCK_LIST 共 {len(codes)} 只")
+    return codes
 
 
 def run_full_analysis(
@@ -1070,43 +1089,57 @@ def run_full_analysis(
     """
     执行完整的分析流程（个股 + 大盘复盘）
 
-    这是定时任务调用的主函数
+    流程：大盘复盘先行 -> 个股分析（注入大盘结论与威科夫信号）
     """
     try:
         # 创建调度器
         pipeline = StockAnalysisPipeline(config=config, max_workers=args.workers)
 
-        # 解析股票列表（支持概念板块自动选股）
+        # 1. 大盘复盘先行（结果传入个股分析作为全局上下文）
+        market_report = ""
+        if config.market_review_enabled and not args.no_market_review:
+            review_result = run_market_review(
+                notifier=pipeline.notifier,
+                analyzer=pipeline.analyzer,
+                search_service=pipeline.search_service,
+            )
+            if review_result:
+                market_report = review_result
+
+        # 2. 解析股票列表（支持概念板块/沙里淘金合并，并限制数量）
         resolved_stock_codes = resolve_stock_codes(
             config,
             args,
             stock_codes,
             notifier=pipeline.notifier,
         )
+        max_count = getattr(config, "max_stock_count", 32)
+        if len(resolved_stock_codes) > max_count:
+            resolved_stock_codes = resolved_stock_codes[:max_count]
+            logger.info(f"[选股] 最终列表截断至 {max_count} 只")
+
+        # 3. 加载威科夫信号（如有，用于个股分析注入）
+        wyckoff_signals: Dict[str, Dict[str, Any]] = {}
+        signals_path = os.getenv("WYCKOFF_SIGNALS_FILE", "wyckoff_signals.json")
+        if Path(signals_path).exists():
+            try:
+                wyckoff_signals = json.loads(Path(signals_path).read_text(encoding="utf-8"))
+                logger.info(f"[选股] 已加载威科夫信号 {len(wyckoff_signals)} 只")
+            except Exception as e:
+                logger.warning(f"加载威科夫信号失败: {e}")
 
         # 命令行参数 --single-notify 覆盖配置（#55）
         if getattr(args, "single_notify", False):
             config.single_stock_notify = True
 
-        # 1. 运行个股分析
+        # 4. 运行个股分析（注入大盘结论与威科夫信号）
         results = pipeline.run(
             stock_codes=resolved_stock_codes,
             dry_run=args.dry_run,
             send_notification=not args.no_notify,
+            market_summary=market_report,
+            wyckoff_signals=wyckoff_signals,
         )
-
-        # 2. 运行大盘复盘（如果启用且不是仅个股模式）
-        market_report = ""
-        if config.market_review_enabled and not args.no_market_review:
-            # 只调用一次，并获取结果
-            review_result = run_market_review(
-                notifier=pipeline.notifier,
-                analyzer=pipeline.analyzer,
-                search_service=pipeline.search_service,
-            )
-            # 如果有结果，赋值给 market_report 用于后续飞书文档生成
-            if review_result:
-                market_report = review_result
 
         # 输出摘要
         if results:

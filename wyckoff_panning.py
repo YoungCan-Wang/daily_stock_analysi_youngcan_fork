@@ -1042,20 +1042,6 @@ def run_panning(
     if tactic_key in ("first_board", "all"):
         results["first_board"] = screen_first_board(data_map, cfg.first_board)
 
-    # 可选：将筛选出的股票代码写入文件（供 workflow 作为 STOCK_LIST 使用）
-    output_list_path = os.getenv("WYCKOFF_OUTPUT_LIST", "").strip()
-    if output_list_path:
-        all_symbols = set()
-        for tactic_results in results.values():
-            for symbol, _ in tactic_results:
-                all_symbols.add(symbol)
-        if all_symbols:
-            Path(output_list_path).parent.mkdir(parents=True, exist_ok=True)
-            Path(output_list_path).write_text(
-                "\n".join(sorted(all_symbols)), encoding="utf-8"
-            )
-            logger.info(f"已写入 {len(all_symbols)} 只股票代码到 {output_list_path}")
-
     tactic_label_map = {
         "all": "全部",
         "resisters": "抗跌主力",
@@ -1063,6 +1049,37 @@ def run_panning(
         "anomalies": "异常吸筹/出货",
         "first_board": "启动龙头",
     }
+
+    # 可选：将筛选出的股票代码写入文件（供 workflow 作为 STOCK_LIST 使用）
+    output_list_path = os.getenv("WYCKOFF_OUTPUT_LIST", "").strip()
+    if output_list_path:
+        all_symbols = set()
+        signals_map: Dict[str, Dict[str, object]] = {}
+        for tactic_key, tactic_results in results.items():
+            label = tactic_label_map.get(tactic_key, tactic_key)
+            for symbol, score in tactic_results:
+                all_symbols.add(symbol)
+                # 保留最高分的战术（多战术时取第一个出现的）
+                if symbol not in signals_map:
+                    signals_map[symbol] = {
+                        "tactic": label,
+                        "tactic_key": tactic_key,
+                        "score": float(score),
+                    }
+        if all_symbols:
+            Path(output_list_path).parent.mkdir(parents=True, exist_ok=True)
+            Path(output_list_path).write_text(
+                "\n".join(sorted(all_symbols)), encoding="utf-8"
+            )
+            logger.info(f"已写入 {len(all_symbols)} 只股票代码到 {output_list_path}")
+            # 同时写入威科夫信号（供 main 分析时注入 context）
+            signals_path = str(output_list_path).replace(".txt", "_signals.json")
+            try:
+                with open(signals_path, "w", encoding="utf-8") as f:
+                    json.dump(signals_map, f, ensure_ascii=False, indent=2)
+                logger.info(f"已写入威科夫信号到 {signals_path}")
+            except Exception as e:
+                logger.warning(f"写入威科夫信号失败: {e}")
 
     report = _build_report(
         results=results,

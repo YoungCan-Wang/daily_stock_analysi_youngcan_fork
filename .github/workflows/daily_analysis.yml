@@ -110,52 +110,65 @@ jobs:
             echo "无有效批次结果"
           fi
 
-      # ========== full 模式：确定 STOCK_LIST（板块/沙里淘金/合并/回退），成功/失败都发飞书 ==========
+      # ========== full 模式：确定 STOCK_LIST（板块/沙里淘金/合并打分 Top32/回退），成功/失败都发飞书 ==========
       - name: 确定股票列表（full 模式）
         if: env.MODE == 'full'
         env:
           FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
           STOCK_LIST_FALLBACK: ${{ secrets.STOCK_LIST || '600519' }}
+          MAX_STOCK_COUNT: ${{ secrets.MAX_STOCK_COUNT || '32' }}
         run: |
-          # 若板块+沙里淘金均有结果，合并去重（板块优先）
-          if [ -f concept_stock_list.txt ] && [ -s concept_stock_list.txt ] && [ -f wyckoff_stock_list.txt ] && [ -s wyckoff_stock_list.txt ]; then
-            echo "使用板块+沙里淘金合并结果"
-            (cat concept_stock_list.txt wyckoff_stock_list.txt | sort -u) > merged_stock_list.txt
-            STOCK_LIST=$(paste -sd, merged_stock_list.txt)
-            echo "STOCK_LIST=$STOCK_LIST" >> $GITHUB_ENV
-            TOTAL=$(wc -l < merged_stock_list.txt)
-            STOCK_LIST_PRETTY=$(awk 'BEGIN{ORS=""} {if(NR>1){if((NR-1)%6==0) printf "\\n"; else printf ","} printf $0}' merged_stock_list.txt)
-            if [ -n "$FEISHU_WEBHOOK_URL" ]; then
-              curl -sS -X POST "$FEISHU_WEBHOOK_URL" \
-                -H "Content-Type: application/json" \
-                -d "{\"msg_type\":\"text\",\"content\":{\"text\":\"【每日股票分析】板块+沙里淘金合并：共 ${TOTAL} 只股票（去重），将执行个股分析。\\n股票代码：\\n${STOCK_LIST_PRETTY}\"}}" || true
+          if [ -f concept_stock_list.txt ] || ls wyckoff_batch_*.txt 1>/dev/null 2>&1; then
+            python scripts/merge_stock_list.py && MERGE_OK=1 || MERGE_OK=0
+            if [ "$MERGE_OK" = "1" ] && [ -f merged_stock_list.txt ] && [ -s merged_stock_list.txt ]; then
+              echo "使用合并结果（板块+沙里淘金打分 Top32）"
+              STOCK_LIST=$(paste -sd, merged_stock_list.txt)
+              echo "STOCK_LIST=$STOCK_LIST" >> $GITHUB_ENV
+              echo "WYCKOFF_SIGNALS_FILE=wyckoff_signals.json" >> $GITHUB_ENV
+              echo "MAX_STOCK_COUNT=$MAX_STOCK_COUNT" >> $GITHUB_ENV
+              TOTAL=$(wc -l < merged_stock_list.txt)
+              STOCK_LIST_PRETTY=$(awk 'BEGIN{ORS=""} {if(NR>1){if((NR-1)%6==0) printf "\\n"; else printf ","} printf $0}' merged_stock_list.txt)
+              if [ -n "$FEISHU_WEBHOOK_URL" ]; then
+                curl -sS -X POST "$FEISHU_WEBHOOK_URL" \
+                  -H "Content-Type: application/json" \
+                  -d "{\"msg_type\":\"text\",\"content\":{\"text\":\"【每日股票分析】板块+沙里淘金合并：共 ${TOTAL} 只（Top${MAX_STOCK_COUNT}），将执行个股分析。\\n股票代码：\\n${STOCK_LIST_PRETTY}\"}}" || true
+              fi
+            else
+              if [ -f concept_stock_list.txt ] && [ -s concept_stock_list.txt ]; then
+                echo "使用板块选股结果"
+                head -n $MAX_STOCK_COUNT concept_stock_list.txt > merged_stock_list.txt
+                STOCK_LIST=$(paste -sd, merged_stock_list.txt)
+                echo "STOCK_LIST=$STOCK_LIST" >> $GITHUB_ENV
+                echo "MAX_STOCK_COUNT=$MAX_STOCK_COUNT" >> $GITHUB_ENV
+                COUNT=$(wc -l < merged_stock_list.txt)
+                STOCK_LIST_PRETTY=$(awk 'BEGIN{ORS=""} {if(NR>1){if((NR-1)%6==0) printf "\\n"; else printf ","} printf $0}' merged_stock_list.txt)
+                if [ -n "$FEISHU_WEBHOOK_URL" ]; then
+                  curl -sS -X POST "$FEISHU_WEBHOOK_URL" \
+                    -H "Content-Type: application/json" \
+                    -d "{\"msg_type\":\"text\",\"content\":{\"text\":\"【每日股票分析】板块选股：成功，共 ${COUNT} 只，将执行个股分析。\\n股票代码：\\n${STOCK_LIST_PRETTY}\"}}" || true
+                fi
+              elif [ -f wyckoff_stock_list.txt ] && [ -s wyckoff_stock_list.txt ]; then
+                echo "使用沙里淘金结果"
+                head -n $MAX_STOCK_COUNT wyckoff_stock_list.txt > merged_stock_list.txt
+                STOCK_LIST=$(paste -sd, merged_stock_list.txt)
+                echo "STOCK_LIST=$STOCK_LIST" >> $GITHUB_ENV
+                echo "WYCKOFF_SIGNALS_FILE=wyckoff_signals.json" >> $GITHUB_ENV
+                echo "MAX_STOCK_COUNT=$MAX_STOCK_COUNT" >> $GITHUB_ENV
+                TOTAL=$(wc -l < merged_stock_list.txt)
+                BATCH_OK=0
+                for f in wyckoff_batch_*.txt; do [ -f "$f" ] && [ -s "$f" ] && BATCH_OK=$((BATCH_OK+1)); done
+                if [ -n "$FEISHU_WEBHOOK_URL" ]; then
+                  curl -sS -X POST "$FEISHU_WEBHOOK_URL" \
+                    -H "Content-Type: application/json" \
+                    -d "{\"msg_type\":\"text\",\"content\":{\"text\":\"【每日股票分析】沙里淘金：共 ${TOTAL} 只（Top${MAX_STOCK_COUNT}），将执行个股分析。\"}}" || true
+                fi
+              fi
             fi
-          elif [ -f concept_stock_list.txt ] && [ -s concept_stock_list.txt ]; then
-            echo "使用板块选股结果"
-            STOCK_LIST=$(paste -sd, concept_stock_list.txt)
-            echo "STOCK_LIST=$STOCK_LIST" >> $GITHUB_ENV
-            COUNT=$(wc -l < concept_stock_list.txt)
-            STOCK_LIST_PRETTY=$(awk 'BEGIN{ORS=""} {if(NR>1){if((NR-1)%6==0) printf "\\n"; else printf ","} printf $0}' concept_stock_list.txt)
-            if [ -n "$FEISHU_WEBHOOK_URL" ]; then
-              curl -sS -X POST "$FEISHU_WEBHOOK_URL" \
-                -H "Content-Type: application/json" \
-                -d "{\"msg_type\":\"text\",\"content\":{\"text\":\"【每日股票分析】板块选股：成功，共 ${COUNT} 只股票，将直接执行个股分析。\\n股票代码：\\n${STOCK_LIST_PRETTY}\"}}" || true
-            fi
-          elif [ -f wyckoff_stock_list.txt ] && [ -s wyckoff_stock_list.txt ]; then
-            echo "使用沙里淘金结果"
-            STOCK_LIST=$(paste -sd, wyckoff_stock_list.txt)
-            echo "STOCK_LIST=$STOCK_LIST" >> $GITHUB_ENV
-            TOTAL=$(wc -l < wyckoff_stock_list.txt)
-            BATCH_OK=0
-            for f in wyckoff_batch_*.txt; do [ -f "$f" ] && [ -s "$f" ] && BATCH_OK=$((BATCH_OK+1)); done
-            if [ -n "$FEISHU_WEBHOOK_URL" ]; then
-              curl -sS -X POST "$FEISHU_WEBHOOK_URL" \
-                -H "Content-Type: application/json" \
-                -d "{\"msg_type\":\"text\",\"content\":{\"text\":\"【每日股票分析】沙里淘金：完成，共 ${BATCH_OK} 批，合计 ${TOTAL} 只股票（去重），将执行后续个股分析。\"}}" || true
-            fi
-          else
+          fi
+          if [ -z "$STOCK_LIST" ]; then
             echo "板块与沙里淘金均无结果，使用配置的 STOCK_LIST"
             echo "STOCK_LIST=$STOCK_LIST_FALLBACK" >> $GITHUB_ENV
+            echo "MAX_STOCK_COUNT=$MAX_STOCK_COUNT" >> $GITHUB_ENV
             if [ -n "$FEISHU_WEBHOOK_URL" ]; then
               curl -sS -X POST "$FEISHU_WEBHOOK_URL" \
                 -H "Content-Type: application/json" \
@@ -173,6 +186,8 @@ jobs:
       - name: 执行股票分析
         if: env.MODE != 'wyckoff'
         env:
+          MAX_STOCK_COUNT: ${{ secrets.MAX_STOCK_COUNT || '32' }}
+          WYCKOFF_SIGNALS_FILE: wyckoff_signals.json
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GEMINI_MODEL: ${{ secrets.GEMINI_MODEL || 'gemini-3-pro-preview' }}
           GEMINI_MODEL_FALLBACK: ${{ secrets.GEMINI_MODEL_FALLBACK || 'gemini-2.5-flash' }}

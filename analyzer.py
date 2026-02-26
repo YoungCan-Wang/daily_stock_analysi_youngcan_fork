@@ -789,11 +789,24 @@ class GeminiAnalyzer:
 | 指数涨跌幅 | {market.get("index_change_pct", "N/A")}% |
 | 市场状态 | {market.get("market_status", "未知")} |
 
----
+"""
+        if context.get("market_summary"):
+            prompt += f"""## 📋 今日大盘复盘结论（优先参考）
+{context["market_summary"]}
 
 """
+        if context.get("wyckoff_signal"):
+            ws = context["wyckoff_signal"]
+            tactic = ws.get("tactic", "未知")
+            score = ws.get("score", "")
+            prompt += f"""## 🧭 沙里淘金选股信号
+该股来自威科夫筛选：**{tactic}** (信号强度: {score})
+请结合此信号权重，在结论中体现该股是「威科夫优选」或需「额外谨慎」。
 
-        prompt += f"""## 📈 技术面数据
+"""
+        prompt += f"""---
+
+## 📈 技术面数据
 
 ### 今日行情
 | 指标 | 数值 |

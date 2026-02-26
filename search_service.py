@@ -627,8 +627,13 @@ class SearchService:
                 return response
             else:
                 logger.warning(f"{provider.name} 搜索失败: {response.error_message}，尝试下一个引擎")
+
+        # 免费舆情兜底：东方财富个股新闻（无 API Key 时使用）
+        free_response = self._fetch_free_stock_news(stock_code, stock_name, max_results)
+        if free_response.success and free_response.results:
+            return free_response
         
-        # 所有引擎都失败
+        # 所有方式都失败
         return SearchResponse(
             query=query,
             results=[],
@@ -636,6 +641,59 @@ class SearchService:
             success=False,
             error_message="所有搜索引擎都不可用或搜索失败"
         )
+
+    def _fetch_free_stock_news(
+        self, stock_code: str, stock_name: str, max_results: int = 5
+    ) -> SearchResponse:
+        """
+        免费舆情兜底：使用 akshare 获取东方财富个股新闻
+        当 Bocha/Tavily/SerpAPI 未配置或全部失败时使用
+        """
+        try:
+            import akshare as ak
+            df = ak.stock_news_em(symbol=stock_code)
+            if df is None or df.empty:
+                return SearchResponse(
+                    query=f"{stock_name} {stock_code}",
+                    results=[],
+                    provider="东方财富(免费)",
+                    success=False,
+                    error_message="东方财富接口返回空数据",
+                )
+            results = []
+            for _, row in df.head(max_results).iterrows():
+                title = str(row.get("新闻标题", row.get("title", ""))).strip()
+                content = str(row.get("新闻内容", row.get("content", ""))).strip()
+                url = str(row.get("新闻链接", row.get("url", ""))).strip()
+                date_val = row.get("发布时间", row.get("date", ""))
+                if not title and not content:
+                    continue
+                results.append(
+                    SearchResult(
+                        title=title or "(无标题)",
+                        snippet=(content or "")[:500],
+                        url=url or "",
+                        source="东方财富",
+                        published_date=str(date_val) if date_val is not None else None,
+                    )
+                )
+            if results:
+                logger.info(f"[免费舆情] 东方财富: {stock_name}({stock_code}) 获取 {len(results)} 条")
+            return SearchResponse(
+                query=f"{stock_name} {stock_code}",
+                results=results,
+                provider="东方财富(免费)",
+                success=bool(results),
+            )
+        except Exception as e:
+            logger.warning(f"[免费舆情] 东方财富接口失败: {e}")
+            return SearchResponse(
+                query=f"{stock_name} {stock_code}",
+                results=[],
+                provider="东方财富(免费)",
+                success=False,
+                error_message=str(e),
+            )
     
     def search_stock_events(
         self,
@@ -729,17 +787,24 @@ class SearchService:
         
         logger.info(f"开始多维度情报搜索: {stock_name}({stock_code})")
         
-        # 轮流使用不同的搜索引擎
+        available_providers = [p for p in self._providers if p.is_available]
         provider_index = 0
         
         for dim in search_dimensions:
             if search_count >= max_searches:
                 break
             
-            # 选择搜索引擎（轮流使用）
-            available_providers = [p for p in self._providers if p.is_available]
+            # 无付费引擎时，仅用免费舆情填充 latest_news
             if not available_providers:
-                break
+                if dim['name'] == 'latest_news':
+                    free_resp = self._fetch_free_stock_news(stock_code, stock_name, max_results=3)
+                    results['latest_news'] = free_resp
+                    if free_resp.success:
+                        logger.info(f"[情报搜索] {dim['desc']}: 免费舆情兜底 {len(free_resp.results)} 条")
+                else:
+                    results[dim['name']] = SearchResponse(query="", results=[], provider="None", success=False)
+                search_count += 1
+                continue
             
             provider = available_providers[provider_index % len(available_providers)]
             provider_index += 1
@@ -754,9 +819,22 @@ class SearchService:
                 logger.info(f"[情报搜索] {dim['desc']}: 获取 {len(response.results)} 条结果")
             else:
                 logger.warning(f"[情报搜索] {dim['desc']}: 搜索失败 - {response.error_message}")
+                # 最新消息维度：免费舆情兜底
+                if dim['name'] == 'latest_news':
+                    free_resp = self._fetch_free_stock_news(stock_code, stock_name, max_results=3)
+                    if free_resp.success and free_resp.results:
+                        results['latest_news'] = free_resp
+                        logger.info(f"[情报搜索] {dim['desc']}: 免费舆情兜底获取 {len(free_resp.results)} 条")
             
             # 短暂延迟避免请求过快
             time.sleep(0.5)
+
+        # 若所有维度都无结果，尝试免费舆情填充 latest_news
+        if not any(r.success and r.results for r in results.values()):
+            free_resp = self._fetch_free_stock_news(stock_code, stock_name, max_results=3)
+            if free_resp.success and free_resp.results:
+                results['latest_news'] = free_resp
+                logger.info(f"[情报搜索] 免费舆情兜底: 获取 {len(free_resp.results)} 条")
         
         return results
     
