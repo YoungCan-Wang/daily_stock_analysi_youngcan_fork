@@ -162,6 +162,139 @@ class MarketAnalyzer:
         """
         return self._get_main_indices()
 
+    def _get_main_indices_akshare_em(self) -> List[MarketIndex]:
+        """使用 akshare 东方财富接口获取指数行情（国内通常更稳定）"""
+        indices: List[MarketIndex] = []
+        # 优先沪深重要指数（含上证、深证、创业板等），再补全
+        em_symbols = ["沪深重要指数", "上证系列指数", "深证系列指数"]
+        all_rows: Dict[str, pd.Series] = {}  # code_base -> row
+
+        for symbol in em_symbols:
+            try:
+                df = self._call_akshare_with_retry(
+                    lambda s=symbol: ak.stock_zh_index_spot_em(symbol=s),
+                    f"指数行情(东财-{symbol})",
+                    attempts=2,
+                )
+                if df is None or df.empty:
+                    continue
+                code_col = self._pick_column(df, ["代码", "code"])
+                if not code_col:
+                    continue
+                for _, row in df.iterrows():
+                    code_raw = row.get(code_col)
+                    code_base = self._normalize_index_code(code_raw)
+                    if not code_base:
+                        continue
+                    # 只保留我们关心的指数
+                    for full_code, name in self.MAIN_INDICES.items():
+                        if full_code.endswith(code_base) or code_base in full_code:
+                            all_rows[code_base] = row
+                            break
+            except Exception as e:
+                logger.warning(f"[大盘] 东财 {symbol} 获取失败: {e}")
+
+        # 构建 MarketIndex
+        for full_code, name in self.MAIN_INDICES.items():
+            code_base = full_code.replace("sh", "").replace("sz", "")
+            if code_base not in all_rows:
+                continue
+            row = all_rows[code_base]
+
+            def _num(keys, default=0.0):
+                for k in (keys if isinstance(keys, (list, tuple)) else [keys]):
+                    v = row.get(k)
+                    if v is None:
+                        continue
+                    try:
+                        f = float(v)
+                        return f if str(v) != "nan" else default
+                    except (TypeError, ValueError):
+                        continue
+                return default
+
+            index = MarketIndex(
+                code=full_code,
+                name=name,
+                current=_num(["最新价", "最新"]),
+                change=_num(["涨跌额", "涨跌"]),
+                change_pct=_num(["涨跌幅", "涨跌幅(%)", "涨跌幅%"]),
+                open=_num(["今开", "开盘"]),
+                high=_num(["最高", "最高价"]),
+                low=_num(["最低", "最低价"]),
+                prev_close=_num(["昨收", "昨收价"]),
+                volume=_num(["成交量", "成交量(手)"]),
+                amount=_num(["成交额", "成交额(元)"]),
+                amplitude=_num(["振幅", "振幅(%)"]),
+            )
+            if index.prev_close > 0 and index.amplitude == 0:
+                index.amplitude = (index.high - index.low) / index.prev_close * 100
+            indices.append(index)
+
+        return indices
+
+    def _get_main_indices_from_daily(self, missing_codes: List[str]) -> List[MarketIndex]:
+        """从日线接口取最近交易日数据（实时全失败时的兜底）"""
+        indices: List[MarketIndex] = []
+        today = datetime.now().strftime("%Y%m%d")
+
+        for code in missing_codes:
+            try:
+                symbol = code.replace("sh", "").replace("sz", "")
+                df = self._call_akshare_with_retry(
+                    lambda s=symbol: ak.stock_zh_index_daily_em(
+                        symbol=s, start_date="19900101", end_date=today
+                    ),
+                    f"指数日线-{code}",
+                    attempts=1,
+                )
+                if df is None or df.empty or len(df) < 2:
+                    continue
+                # 取最近两行，判断今日是否已有数据
+                date_col = "date" if "date" in df.columns else "日期"
+                df = df.sort_values(date_col, ascending=False).reset_index(drop=True)
+                last = df.iloc[0]
+                prev = df.iloc[1] if len(df) > 1 else last
+
+                def _v(row, keys, default=0.0):
+                    for k in (keys if isinstance(keys, (list, tuple)) else [keys]):
+                        v = row.get(k)
+                        if v is None:
+                            continue
+                        try:
+                            f = float(v)
+                            return f if str(v) != "nan" else default
+                        except (TypeError, ValueError):
+                            continue
+                    return default
+
+                close = _v(last, ["close", "收盘"], 0)
+                prev_close = _v(prev, ["close", "收盘"], close)
+                change = close - prev_close
+                change_pct = (change / prev_close * 100) if prev_close else 0
+                name = self.MAIN_INDICES.get(code, code)
+                index = MarketIndex(
+                    code=code,
+                    name=name,
+                    current=close,
+                    change=change,
+                    change_pct=change_pct,
+                    open=_v(last, ["open", "开盘"], close),
+                    high=_v(last, ["high", "最高"], close),
+                    low=_v(last, ["low", "最低"], close),
+                    prev_close=prev_close,
+                    volume=_v(last, ["volume", "成交量"], 0),
+                    amount=_v(last, ["amount", "成交额"], 0),
+                )
+                if index.prev_close > 0:
+                    index.amplitude = (index.high - index.low) / index.prev_close * 100
+                indices.append(index)
+                logger.info(f"[大盘] 日线兜底: {name} {close:.2f} ({change_pct:+.2f}%)")
+            except Exception as e:
+                logger.debug(f"[大盘] 日线 {code} 失败: {e}")
+
+        return indices
+
     def _call_akshare_with_retry(self, fn, name: str, attempts: int = 2):
         last_error: Optional[Exception] = None
         for attempt in range(1, attempts + 1):
@@ -193,59 +326,66 @@ class MarketAnalyzer:
             yield
 
     def _get_main_indices(self) -> List[MarketIndex]:
-        """获取主要指数实时行情"""
-        indices = []
+        """获取主要指数实时行情（多源尝试：东财 EM → 新浪 Sina → efinance）"""
         results_by_code: Dict[str, MarketIndex] = {}
 
-        try:
-            logger.info("[大盘] 获取主要指数实时行情...")
+        # 1. 优先尝试东方财富（国内访问更稳定）
+        em_indices = self._get_main_indices_akshare_em()
+        for idx in em_indices:
+            results_by_code[idx.code] = idx
+        if results_by_code:
+            logger.info(f"[大盘] 东方财富获取到 {len(results_by_code)} 个指数")
 
-            # 使用 akshare 获取指数行情（新浪财经接口，包含深市指数）
-            df = self._call_akshare_with_retry(
-                ak.stock_zh_index_spot_sina, "指数行情", attempts=2
-            )
-
-            if df is not None and not df.empty:
-                for code, name in self.MAIN_INDICES.items():
-                    # 查找对应指数
-                    row = df[df["代码"] == code]
-                    if row.empty:
-                        # 尝试带前缀查找
-                        row = df[df["代码"].str.contains(code)]
-
-                    if not row.empty:
-                        row = row.iloc[0]
-                        index = MarketIndex(
-                            code=code,
-                            name=name,
-                            current=float(row.get("最新价", 0) or 0),
-                            change=float(row.get("涨跌额", 0) or 0),
-                            change_pct=float(row.get("涨跌幅", 0) or 0),
-                            open=float(row.get("今开", 0) or 0),
-                            high=float(row.get("最高", 0) or 0),
-                            low=float(row.get("最低", 0) or 0),
-                            prev_close=float(row.get("昨收", 0) or 0),
-                            volume=float(row.get("成交量", 0) or 0),
-                            amount=float(row.get("成交额", 0) or 0),
-                        )
-                        # 计算振幅
-                        if index.prev_close > 0:
-                            index.amplitude = (
-                                (index.high - index.low) / index.prev_close * 100
+        # 2. 新浪补齐或首次获取
+        if len(results_by_code) < len(self.MAIN_INDICES):
+            try:
+                df = self._call_akshare_with_retry(
+                    ak.stock_zh_index_spot_sina, "指数行情(新浪)", attempts=2
+                )
+                if df is not None and not df.empty:
+                    for code, name in self.MAIN_INDICES.items():
+                        if code in results_by_code:
+                            continue
+                        row = df[df["代码"] == code]
+                        if row.empty:
+                            row = df[df["代码"].astype(str).str.contains(code.replace("sh", "").replace("sz", ""))]
+                        if not row.empty:
+                            row = row.iloc[0]
+                            index = MarketIndex(
+                                code=code,
+                                name=name,
+                                current=float(row.get("最新价", 0) or 0),
+                                change=float(row.get("涨跌额", 0) or 0),
+                                change_pct=float(row.get("涨跌幅", 0) or 0),
+                                open=float(row.get("今开", 0) or 0),
+                                high=float(row.get("最高", 0) or 0),
+                                low=float(row.get("最低", 0) or 0),
+                                prev_close=float(row.get("昨收", 0) or 0),
+                                volume=float(row.get("成交量", 0) or 0),
+                                amount=float(row.get("成交额", 0) or 0),
                             )
-                        results_by_code[code] = index
+                            if index.prev_close > 0:
+                                index.amplitude = (index.high - index.low) / index.prev_close * 100
+                            results_by_code[code] = index
+                    logger.info(f"[大盘] 新浪补齐后共 {len(results_by_code)} 个指数")
+            except Exception as e:
+                logger.warning(f"[大盘] 新浪指数获取失败: {e}")
 
-                logger.info(f"[大盘] 获取到 {len(results_by_code)} 个指数行情 (AkShare)")
-
-        except Exception as e:
-            logger.error(f"[大盘] 获取指数行情失败: {e}")
-
-        # 使用 efinance 补齐缺失指数
+        # 3. 使用 efinance 补齐缺失指数
         missing = [c for c in self.MAIN_INDICES if c not in results_by_code]
         if missing:
             ef_indices = self._get_main_indices_efinance(missing)
             for idx in ef_indices:
                 results_by_code[idx.code] = idx
+
+        # 4. 最后兜底：用日线 API 取最近交易日数据（实时接口全失败时）
+        missing = [c for c in self.MAIN_INDICES if c not in results_by_code]
+        if missing:
+            daily_indices = self._get_main_indices_from_daily(missing)
+            for idx in daily_indices:
+                results_by_code[idx.code] = idx
+            if daily_indices:
+                logger.info(f"[大盘] 日线兜底获取 {len(daily_indices)} 个指数")
 
         indices = [results_by_code[c] for c in self.MAIN_INDICES if c in results_by_code]
         return indices
@@ -764,6 +904,26 @@ class MarketAnalyzer:
 
         return self._apply_sector_rankings_from_df(overview, df)
 
+    def _is_overview_data_invalid(self, overview: MarketOverview) -> bool:
+        """
+        判断大盘数据是否无效（成交量为0、涨跌幅为0 等）
+        非交易时段或数据源异常时，会返回全 0 数据，传给 AI 会误导分析
+        """
+        # 指数：所有指数涨跌幅接近 0 且无有效成交
+        if overview.indices:
+            all_zero_pct = all(abs(idx.change_pct or 0) < 0.01 for idx in overview.indices)
+            indices_vol = sum(idx.volume or 0 for idx in overview.indices)
+            indices_amt = sum(idx.amount or 0 for idx in overview.indices)
+            # 成交额/量为 0 或极小，且涨跌幅全 0
+            no_volume = indices_vol < 100 and (overview.total_amount or 0) < 1
+            no_amount = indices_amt < 1e8 and (overview.total_amount or 0) < 1
+            if all_zero_pct and (no_volume or no_amount):
+                logger.warning(
+                    "[大盘] 数据异常：指数涨跌幅和成交量/额均为0，可能为非交易时段或数据源故障"
+                )
+                return True
+        return False
+
     def _is_overview_empty(self, overview: MarketOverview) -> bool:
         indices_ok = len(overview.indices) > 0
         stats_ok = any(
@@ -850,10 +1010,20 @@ class MarketAnalyzer:
         # 1. 获取市场概览
         overview = self.get_market_overview()
 
-        # 2. 搜索市场新闻
+        # 2. 校验数据有效性：成交量为0、涨跌幅为0 时跳过 AI 分析，避免误导
+        if self._is_overview_data_invalid(overview):
+            skip_note = (
+                "**当前为非交易时段或数据源异常**，无法获取有效的成交量和涨跌幅数据。"
+                "为避免误导，暂不生成大盘复盘。\n\n"
+                "建议在交易时段（9:30-15:00 北京时）运行，或检查数据源连接。"
+            )
+            logger.warning("[大盘] 跳过 AI 复盘（数据无效）")
+            return skip_note
+
+        # 3. 搜索市场新闻
         news = self.search_market_news()
 
-        # 3. 生成复盘报告
+        # 4. 生成复盘报告
         report = self.generate_market_review(overview, news)
 
         logger.info("========== 大盘复盘分析完成 ==========")

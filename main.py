@@ -735,6 +735,12 @@ class StockAnalysisPipeline:
             success_count = len(results)
             fail_count = len(stock_codes) - success_count
 
+        failed_codes = [c for c in stock_codes if c not in {r.code for r in results}]
+        if failed_codes:
+            logger.warning(
+                f"以下 {len(failed_codes)} 只因数据获取失败或缺少历史数据被跳过: {', '.join(failed_codes)}"
+            )
+
         logger.info(f"===== 分析完成 =====")
         logger.info(
             f"成功: {success_count}, 失败: {fail_count}, 耗时: {elapsed_time:.2f} 秒"
@@ -745,14 +751,17 @@ class StockAnalysisPipeline:
             if single_stock_notify:
                 # 单股推送模式：只保存汇总报告，不再重复推送
                 logger.info("单股推送模式：跳过汇总推送，仅保存报告到本地")
-                self._send_notifications(results, skip_push=True)
+                self._send_notifications(results, skip_push=True, failed_codes=failed_codes)
             else:
-                self._send_notifications(results)
+                self._send_notifications(results, failed_codes=failed_codes)
 
         return results
 
     def _send_notifications(
-        self, results: List[AnalysisResult], skip_push: bool = False
+        self,
+        results: List[AnalysisResult],
+        skip_push: bool = False,
+        failed_codes: Optional[List[str]] = None,
     ) -> None:
         """
         发送分析结果通知
@@ -762,12 +771,15 @@ class StockAnalysisPipeline:
         Args:
             results: 分析结果列表
             skip_push: 是否跳过推送（仅保存到本地，用于单股推送模式）
+            failed_codes: 因数据获取失败被跳过的股票代码列表
         """
         try:
             logger.info("生成决策仪表盘日报...")
 
             # 生成决策仪表盘格式的详细日报
-            report = self.notifier.generate_dashboard_report(results)
+            report = self.notifier.generate_dashboard_report(
+                results, failed_codes=failed_codes or []
+            )
 
             # 保存到本地
             filepath = self.notifier.save_report_to_file(report)
@@ -1173,8 +1185,13 @@ def run_full_analysis(
 
                 # 添加个股决策仪表盘（使用 NotificationService 生成）
                 if results:
+                    failed = [
+                        c
+                        for c in resolved_stock_codes
+                        if c not in {r.code for r in results}
+                    ]
                     dashboard_content = pipeline.notifier.generate_dashboard_report(
-                        results
+                        results, failed_codes=failed
                     )
                     full_content += f"# 🚀 个股决策仪表盘\n\n{dashboard_content}"
 

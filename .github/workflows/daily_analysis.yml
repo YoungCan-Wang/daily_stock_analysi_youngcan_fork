@@ -22,6 +22,8 @@ on:
 jobs:
   analyze:
     runs-on: ubuntu-latest
+    env:
+      AKSHARE_NO_PROXY: 'true'
 
     steps:
       - name: 检出代码
@@ -52,24 +54,9 @@ jobs:
           echo "ALWAYS_RUN_WYCKOFF=${ALWAYS_RUN_WYCKOFF}" >> $GITHUB_ENV
           echo "运行模式: $MODE"
 
-      # ========== full 模式 1：先尝试板块选股（GitHub 用 secrets，本地用 .env）==========
-      - name: 尝试板块选股
-        id: concept
-        if: env.MODE == 'full'
-        env:
-          FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
-          CONCEPT_BOARD_TOP_N: ${{ secrets.CONCEPT_BOARD_TOP_N || '10' }}
-          CONCEPT_STOCKS_PER_BOARD: ${{ secrets.CONCEPT_STOCKS_PER_BOARD || '6' }}
-        run: |
-          python main.py --concept-only
-          CONCEPT_EXIT=$?
-          echo "CONCEPT_EXIT=$CONCEPT_EXIT" >> $GITHUB_ENV
-          echo "板块选股退出码: $CONCEPT_EXIT (0=有股票 1=有板块无股票 2=失败)"
-          exit 0
-
-      # ========== full 模式 2：板块无股票/失败时执行沙里淘金；或 ALWAYS_RUN_WYCKOFF=true 时也执行 ==========
+      # ========== full 模式 1：先执行沙里淘金（威科夫选股）==========
       - name: 执行沙里淘金（分批获取股票列表）
-        if: env.MODE == 'full' && (env.CONCEPT_EXIT != '0' || env.ALWAYS_RUN_WYCKOFF == 'true')
+        if: env.MODE == 'full'
         timeout-minutes: 120
         continue-on-error: true
         env:
@@ -101,7 +88,7 @@ jobs:
 
       # ========== full 模式：合并沙里淘金结果（去重）==========
       - name: 合并沙里淘金结果
-        if: env.MODE == 'full' && (env.CONCEPT_EXIT != '0' || env.ALWAYS_RUN_WYCKOFF == 'true')
+        if: env.MODE == 'full'
         run: |
           cat wyckoff_batch_*.txt 2>/dev/null | sort -u > wyckoff_stock_list.txt || true
           if [ -s wyckoff_stock_list.txt ]; then
@@ -110,7 +97,22 @@ jobs:
             echo "无有效批次结果"
           fi
 
-      # ========== full 模式：确定 STOCK_LIST（板块/沙里淘金/合并打分 Top32/回退），成功/失败都发飞书 ==========
+      # ========== full 模式 2：再尝试板块选股（概念板块选股）==========
+      - name: 尝试板块选股
+        id: concept
+        if: env.MODE == 'full'
+        env:
+          FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
+          CONCEPT_BOARD_TOP_N: ${{ secrets.CONCEPT_BOARD_TOP_N || '10' }}
+          CONCEPT_STOCKS_PER_BOARD: ${{ secrets.CONCEPT_STOCKS_PER_BOARD || '6' }}
+        run: |
+          python main.py --concept-only
+          CONCEPT_EXIT=$?
+          echo "CONCEPT_EXIT=$CONCEPT_EXIT" >> $GITHUB_ENV
+          echo "板块选股退出码: $CONCEPT_EXIT (0=有股票 1=有板块无股票 2=失败)"
+          exit 0
+
+      # ========== full 模式：确定 STOCK_LIST（板块+沙里淘金/合并打分 Top32/回退），成功/失败都发飞书 ==========
       - name: 确定股票列表（full 模式）
         if: env.MODE == 'full'
         env:

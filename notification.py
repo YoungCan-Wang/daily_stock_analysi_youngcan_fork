@@ -507,7 +507,10 @@ class NotificationService:
         return counts
 
     def generate_dashboard_report(
-        self, results: List[AnalysisResult], report_date: Optional[str] = None
+        self,
+        results: List[AnalysisResult],
+        report_date: Optional[str] = None,
+        failed_codes: Optional[List[str]] = None,
     ) -> str:
         """
         生成决策仪表盘格式的日报（详细版）
@@ -517,12 +520,15 @@ class NotificationService:
         Args:
             results: 分析结果列表
             report_date: 报告日期（默认今天）
+            failed_codes: 因数据获取失败被跳过的股票代码列表
 
         Returns:
             Markdown 格式的决策仪表盘日报
         """
         if report_date is None:
             report_date = datetime.now().strftime("%Y-%m-%d")
+
+        failed_codes = failed_codes or []
 
         # 按评分排序（高分在前）
         sorted_results = sorted(results, key=lambda x: x.sentiment_score, reverse=True)
@@ -533,14 +539,24 @@ class NotificationService:
         hold_count = counts["hold"]
         sell_count = counts["sell"]
 
+        summary_line = f"> 共分析 **{len(results)}** 只股票 | 🟢买入:{buy_count} 🟡持有/观望:{hold_count} 🔴卖出:{sell_count}"
+        if failed_codes:
+            summary_line += f" | ⚠️ 跳过 {len(failed_codes)} 只（数据获取失败）"
+
         report_lines = [
             f"# 🎯 {report_date} 决策仪表盘",
             "",
-            f"> 共分析 **{len(results)}** 只股票 | 🟢买入:{buy_count} 🟡持有/观望:{hold_count} 🔴卖出:{sell_count}",
-            "",
-            "---",
+            summary_line,
             "",
         ]
+        if failed_codes:
+            report_lines.extend(
+                [
+                    f"⚠️ **以下 {len(failed_codes)} 只因数据获取失败或缺少历史数据被跳过**：{', '.join(failed_codes)}",
+                    "",
+                ]
+            )
+        report_lines.extend(["---", ""])
 
         # 逐个股票的决策仪表盘
         total_stocks = len(sorted_results)
